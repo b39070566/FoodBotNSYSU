@@ -5,13 +5,14 @@ from typing import Any
 class State(Enum):
     IDLE = auto()
     WAIT_NAME = auto()
-    WAIT_DUP_CONFIRM = auto()  # 重複店名確認
+    WAIT_DUP_CONFIRM = auto()
     WAIT_CATEGORY = auto()
-    WAIT_PRICE = auto()        # 價位選擇
+    WAIT_PRICE = auto()
     WAIT_IMAGE = auto()
     WAIT_REVIEW = auto()
     WAIT_PICK = auto()
-    WAIT_LIKE = auto()         # 看完店家後是否按讚
+    WAIT_LIKE = auto()
+    FILTER_PICK = auto()       # 新增：篩選分類選號碼
     MANAGE_PICK = auto()
     MANAGE_ACTION = auto()
     EDIT_NAME = auto()

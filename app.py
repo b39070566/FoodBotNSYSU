@@ -45,6 +45,10 @@ PRICE_MENU = "請選擇價位區間：\n" + "\n".join(
     f"{i+1}. {p}" for i, p in enumerate(PRICE_RANGES)
 ) + "\n\n輸入 1~4"
 
+FILTER_MENU = "請選擇要篩選的分類：\n" + "\n".join(
+    f"{i+1}. {c}" for i, c in enumerate(CATEGORIES)
+) + "\n8. 全部\n\n輸入 1~8"
+
 
 def upload_image(image_content, message_id: str):
     raw_bytes = b''.join(image_content.iter_content())
@@ -213,24 +217,39 @@ def callback():
             reply(reply_token, format_list(restaurants))
             continue
 
-        # ── 分類篩選：輸入「找 🍜 麵食」 ──
-        if msg.startswith('找 ') or msg.startswith('找　'):
-            keyword = msg[2:].strip()
-            matched = next((c for c in CATEGORIES if keyword in c), None)
-            if matched:
-                restaurants = db.get_recent(limit=30, category=matched)
-                if not restaurants:
-                    reply(reply_token, f'目前沒有「{matched}」的分享')
-                    continue
-                states.reset(user_id)
-                states.set(user_id, State.WAIT_PICK)
-                states.set_data(user_id, 'list', [r['id'] for r in restaurants])
-                reply(reply_token, f'📂 {matched} 的推薦\n\n' + format_list(restaurants))
-            else:
-                cats = '\n'.join(f'找 {c}' for c in CATEGORIES)
-                reply(reply_token, f'找不到這個分類，請輸入：\n\n{cats}')
+        # ── 篩選分類 ──────────────────────────────────────────────────────────
+        if msg == '篩選分類':
+            states.reset(user_id)
+            states.set(user_id, State.FILTER_PICK)
+            reply(reply_token, FILTER_MENU)
             continue
 
+        if state == State.FILTER_PICK and msg.isdigit():
+            idx = int(msg) - 1
+            if msg == '8' or idx == 7:
+                # 全部
+                restaurants = db.get_recent(limit=30)
+                label = '全部推薦'
+                category = None
+            elif 0 <= idx < len(CATEGORIES):
+                category = CATEGORIES[idx]
+                restaurants = db.get_recent(limit=30, category=category)
+                label = category
+            else:
+                reply(reply_token, FILTER_MENU)
+                continue
+
+            if not restaurants:
+                states.reset(user_id)
+                reply(reply_token, f'目前沒有「{label}」的分享')
+                continue
+
+            states.set(user_id, State.WAIT_PICK)
+            states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+            reply(reply_token, f'📂 {label}\n\n' + format_list(restaurants))
+            continue
+
+        # ── 看店家詳情 ────────────────────────────────────────────────────────
         if state == State.WAIT_PICK and msg.isdigit():
             idx = int(msg) - 1
             id_list = states.get_data(user_id).get('list', [])
@@ -251,8 +270,8 @@ def callback():
                                  f"🏷️ {r.get('category','')}　{r.get('price_range','')}\n"
                                  f"💬 「{r['review']}」\n"
                                  f"👍 {r['like_count']} 個讚\n\n"
-                                 f"輸入「讚」{heart} 幫這家店按讚\n"
-                                 f"輸入「近期推薦」繼續瀏覽"
+                                 f"輸入「讚」{heart} 按讚／收回讚\n"
+                                 f"輸入「近期推薦」或「篩選分類」繼續瀏覽"
                         ),
                     ])
                     continue
@@ -265,7 +284,7 @@ def callback():
             r = db.get_by_id(rid)
             states.reset(user_id)
             if result == 'liked':
-                reply(reply_token, f"👍 已幫「{r['name']}」按讚！\n現在共 {r['like_count']} 個讚\n\n輸入「近期推薦」繼續瀏覽")
+                reply(reply_token, f"👍 已幫「{r['name']}」按讚！\n現在共 {r['like_count']} 個讚\n\n輸入「近期推薦」或「篩選分類」繼續瀏覽")
             else:
                 reply(reply_token, f"已收回「{r['name']}」的讚\n現在共 {r['like_count']} 個讚")
             continue
@@ -375,7 +394,6 @@ def callback():
     return 'OK'
 
 
-# ── 工具函式 ──────────────────────────────────────────────────────────────────
 def reply(token, text_or_list):
     if isinstance(text_or_list, str):
         line_bot_api.reply_message(token, TextSendMessage(text=text_or_list))
@@ -402,23 +420,18 @@ def format_my_list(restaurants: list) -> str:
 
 
 def introduction() -> str:
-    cat_list = '　'.join(c.split()[0] for c in CATEGORIES)
     return (
         '📋 學生餐廳分享系統 使用說明\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        '📤 分享餐廳：\n'
-        '  輸入「我要分享」\n'
-        '  → 名稱 → 分類 → 價位 → 照片 → 評論\n\n'
-        '📋 查看推薦：\n'
-        '  輸入「近期推薦」→ 輸入編號\n'
-        '  → 可以按讚 👍\n\n'
-        '🔍 分類篩選：\n'
-        f'  輸入「找 ＋分類名稱」\n'
-        f'  例如：找 🍜 麵食\n\n'
-        '✏️ 管理我的分享：\n'
-        '  輸入「管理我的分享」\n\n'
-        '❌ 取消操作：輸入「取消」\n'
-        '📖 說明：輸入「說明」'
+        '📤 我要分享\n'
+        '   → 名稱→分類→價位→照片→評論\n\n'
+        '📋 近期推薦\n'
+        '   → 熱度排序，輸入編號看詳情\n\n'
+        '🔍 篩選分類\n'
+        '   → 選分類後看該分類推薦\n\n'
+        '✏️ 管理我的分享\n'
+        '   → 修改或刪除自己的貼文\n\n'
+        '❌ 取消　　📖 說明'
     )
 
 
