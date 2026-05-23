@@ -5,16 +5,20 @@ from typing import Any
 class State(Enum):
     IDLE = auto()
     WAIT_NAME = auto()
-    WAIT_CATEGORY = auto()   # 新增：等選分類
+    WAIT_DUP_CONFIRM = auto()  # 重複店名確認
+    WAIT_CATEGORY = auto()
+    WAIT_PRICE = auto()        # 價位選擇
     WAIT_IMAGE = auto()
     WAIT_REVIEW = auto()
     WAIT_PICK = auto()
+    WAIT_LIKE = auto()         # 看完店家後是否按讚
     MANAGE_PICK = auto()
     MANAGE_ACTION = auto()
     EDIT_NAME = auto()
     EDIT_REVIEW = auto()
     EDIT_IMAGE = auto()
-    EDIT_CATEGORY = auto()   # 新增：管理時修改分類
+    EDIT_CATEGORY = auto()
+    EDIT_PRICE = auto()
 
 
 class StateManager:
