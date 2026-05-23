@@ -1,24 +1,22 @@
-# state_manager.py
-# 每個使用者的對話狀態機
-
 from enum import Enum, auto
 from typing import Any
 
 
 class State(Enum):
-    IDLE = auto()         # 閒置
-    WAIT_NAME = auto()    # 分享流程：等店家名稱
-    WAIT_IMAGE = auto()   # 分享流程：等照片
-    WAIT_REVIEW = auto()  # 分享流程：等評論
-    WAIT_PICK = auto()    # 推薦流程：等使用者選號碼
+    IDLE = auto()
+    WAIT_NAME = auto()
+    WAIT_IMAGE = auto()
+    WAIT_REVIEW = auto()
+    WAIT_PICK = auto()
+    # 管理流程
+    MANAGE_PICK = auto()       # 選要管理哪一筆
+    MANAGE_ACTION = auto()     # 選要做什麼（修改名稱/評論/照片/刪除）
+    EDIT_NAME = auto()
+    EDIT_REVIEW = auto()
+    EDIT_IMAGE = auto()
 
 
 class StateManager:
-    """
-    In-memory 狀態機，以 user_id 為 key。
-    如果需要持久化（重啟後保留），可改成 Redis 版本。
-    """
-
     def __init__(self):
         self._states: dict[str, State] = {}
         self._data: dict[str, dict] = {}
