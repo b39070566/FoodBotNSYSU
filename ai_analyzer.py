@@ -37,7 +37,7 @@ def analyze_food_image(image_bytes: bytes) -> dict:
 
         # 官方文件順序：圖片在前，文字在後
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[image_part, PROMPT],
         )
 
