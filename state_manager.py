@@ -5,15 +5,16 @@ from typing import Any
 class State(Enum):
     IDLE = auto()
     WAIT_NAME = auto()
+    WAIT_CATEGORY = auto()   # 新增：等選分類
     WAIT_IMAGE = auto()
     WAIT_REVIEW = auto()
     WAIT_PICK = auto()
-    # 管理流程
-    MANAGE_PICK = auto()       # 選要管理哪一筆
-    MANAGE_ACTION = auto()     # 選要做什麼（修改名稱/評論/照片/刪除）
+    MANAGE_PICK = auto()
+    MANAGE_ACTION = auto()
     EDIT_NAME = auto()
     EDIT_REVIEW = auto()
     EDIT_IMAGE = auto()
+    EDIT_CATEGORY = auto()   # 新增：管理時修改分類
 
 
 class StateManager:

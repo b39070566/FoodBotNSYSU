@@ -3,7 +3,17 @@ import os
 from typing import Optional
 
 DB_PATH = os.getenv("CANTEEN_DB_PATH", "canteen.db")
-MAX_RESTAURANTS = 10  # 上限，超過刪最舊的
+MAX_RESTAURANTS = 10
+
+CATEGORIES = [
+    "🍱 便當／快餐",
+    "🍜 麵食／湯品",
+    "🥗 輕食／沙拉",
+    "🧋 飲料／甜點",
+    "🍔 西式／速食",
+    "🍣 日韓料理",
+    "🥞 早午餐",
+]
 
 
 class CanteenDB:
@@ -23,24 +33,29 @@ class CanteenDB:
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id    TEXT NOT NULL,
                     name       TEXT NOT NULL,
+                    category   TEXT NOT NULL DEFAULT '其他',
                     image_url  TEXT NOT NULL,
                     review     TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
             """)
+            # 舊資料庫若沒有 category 欄位，自動加上
+            try:
+                conn.execute("ALTER TABLE restaurants ADD COLUMN category TEXT NOT NULL DEFAULT '其他'")
+            except Exception:
+                pass
             conn.commit()
 
-    def add_restaurant(self, user_id, name, image_url, review) -> int:
+    def add_restaurant(self, user_id, name, category, image_url, review) -> int:
         from datetime import datetime
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._connect() as conn:
             cur = conn.execute(
-                "INSERT INTO restaurants (user_id, name, image_url, review, created_at) VALUES (?,?,?,?,?)",
-                (user_id, name, image_url, review, now)
+                "INSERT INTO restaurants (user_id, name, category, image_url, review, created_at) VALUES (?,?,?,?,?,?)",
+                (user_id, name, category, image_url, review, now)
             )
             conn.commit()
             new_id = cur.lastrowid
-            # 超過上限，刪最舊的
             self._enforce_limit(conn)
             return new_id
 
@@ -58,7 +73,7 @@ class CanteenDB:
     def get_recent(self, limit: int = 10) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT id, name, image_url, review, created_at FROM restaurants ORDER BY id DESC LIMIT ?",
+                "SELECT id, name, category, image_url, review, created_at FROM restaurants ORDER BY id DESC LIMIT ?",
                 (limit,)
             ).fetchall()
         return [dict(r) for r in rows]
@@ -71,7 +86,6 @@ class CanteenDB:
         return dict(row) if row else None
 
     def get_by_user(self, user_id: str) -> list[dict]:
-        """取得某使用者的所有分享"""
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM restaurants WHERE user_id = ? ORDER BY id DESC",
@@ -102,6 +116,15 @@ class CanteenDB:
             cur = conn.execute(
                 "UPDATE restaurants SET image_url=? WHERE id=? AND user_id=?",
                 (image_url, restaurant_id, user_id)
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    def update_category(self, restaurant_id: int, user_id: str, category: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "UPDATE restaurants SET category=? WHERE id=? AND user_id=?",
+                (category, restaurant_id, user_id)
             )
             conn.commit()
         return cur.rowcount > 0
