@@ -1,12 +1,14 @@
 import os
 import json
-from google import genai
-from google.genai import types
+import base64
+import requests
 from canteen_db import CATEGORIES, PRICE_RANGES
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 PROMPT = f"""
 你是一個台灣學生餐廳推薦系統的食物辨識助手。
-請分析這張食物照片，回傳 JSON 格式（不要加任何其他文字）：
+請分析這張食物照片，回傳 JSON 格式（不要加任何其他文字、不要加 markdown）：
 
 分類選項（從以下選一個最符合的）：
 {chr(10).join(f'{i+1}. {c}' for i, c in enumerate(CATEGORIES))}
@@ -28,20 +30,41 @@ PROMPT = f"""
 
 def analyze_food_image(image_bytes: bytes) -> dict:
     try:
-        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        image_part = types.Part.from_bytes(
-            data=image_bytes,
-            mime_type="image/jpeg",
+        response = requests.post(
+            GROQ_API_URL,
+            headers={
+                "Authorization": f"Bearer {os.getenv('GROQ_API_KEY')}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "meta-llama/llama-4-scout-17b-16e-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": PROMPT
+                            }
+                        ]
+                    }
+                ],
+                "max_tokens": 300,
+                "temperature": 0.1,
+            },
+            timeout=30,
         )
 
-        # 官方文件順序：圖片在前，文字在後
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[image_part, PROMPT],
-        )
-
-        text = response.text.strip()
+        data = response.json()
+        text = data["choices"][0]["message"]["content"].strip()
 
         if "```" in text:
             text = text.split("```")[1]
@@ -60,7 +83,7 @@ def analyze_food_image(image_bytes: bytes) -> dict:
         return result
 
     except Exception as e:
-        print(f"Gemini analyze error: {e}")
+        print(f"Groq analyze error: {e}")
         return {
             "food_name": "無法辨識",
             "category": CATEGORIES[0],
