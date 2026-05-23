@@ -9,10 +9,11 @@ class State(Enum):
     WAIT_CATEGORY = auto()
     WAIT_PRICE = auto()
     WAIT_IMAGE = auto()
+    WAIT_AI_CONFIRM = auto()   # 新增：確認 AI 辨識結果
     WAIT_REVIEW = auto()
     WAIT_PICK = auto()
     WAIT_LIKE = auto()
-    FILTER_PICK = auto()       # 新增：篩選分類選號碼
+    FILTER_PICK = auto()
     MANAGE_PICK = auto()
     MANAGE_ACTION = auto()
     EDIT_NAME = auto()

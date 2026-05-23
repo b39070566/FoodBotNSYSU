@@ -16,6 +16,7 @@ import cloudinary.uploader
 
 from canteen_db import CanteenDB, CATEGORIES, PRICE_RANGES
 from state_manager import StateManager, State
+from ai_analyzer import analyze_food_image
 
 app = Flask(__name__)
 
@@ -50,10 +51,9 @@ FILTER_MENU = "請選擇要篩選的分類：\n" + "\n".join(
 ) + "\n8. 全部\n\n輸入 1~8"
 
 
-def upload_image(image_content, message_id: str):
-    raw_bytes = b''.join(image_content.iter_content())
+def upload_image(image_bytes: bytes, message_id: str) -> str:
     result = cloudinary.uploader.upload(
-        raw_bytes,
+        image_bytes,
         public_id=f'canteen/{message_id}',
         overwrite=True,
     )
@@ -80,26 +80,55 @@ def callback():
 
         # ── 圖片訊息 ──────────────────────────────────────────────────────────
         if isinstance(event.message, ImageMessage):
+            raw = line_bot_api.get_message_content(event.message.id)
+            image_bytes = b''.join(raw.iter_content())
+
             if state == State.WAIT_IMAGE:
-                image_content = line_bot_api.get_message_content(event.message.id)
                 try:
-                    image_url = upload_image(image_content, event.message.id)
+                    # 上傳圖片
+                    image_url = upload_image(image_bytes, event.message.id)
                     states.set_data(user_id, 'image_url', image_url)
-                    states.set(user_id, State.WAIT_REVIEW)
-                    reply(reply_token, '📷 照片收到！\n\n最後，請輸入一句【評論】\n例如：滷肉飯超香，CP 值超高！')
+
+                    # AI 辨識
+                    reply(reply_token, '📷 照片收到，AI 辨識中...')
+                    ai = analyze_food_image(image_bytes)
+
+                    states.set_data(user_id, 'ai_category', ai['category'])
+                    states.set_data(user_id, 'ai_price', ai['price_range'])
+                    states.set(user_id, State.WAIT_AI_CONFIRM)
+
+                    confidence_note = {
+                        'high': '✅ 辨識很有把握',
+                        'medium': '🔍 辨識有點把握',
+                        'low': '⚠️ 辨識把握度低，建議手動修改',
+                    }.get(ai['confidence'], '')
+
+                    line_bot_api.push_message(user_id, TextSendMessage(
+                        text=f"🤖 AI 辨識結果：\n"
+                             f"🍽️ {ai['food_name']}\n"
+                             f"🏷️ 分類：{ai['category']}\n"
+                             f"💰 價位：{ai['price_range']}\n"
+                             f"{confidence_note}\n\n"
+                             f"1. 確認，直接使用\n"
+                             f"2. 修改分類\n"
+                             f"3. 修改價位\n"
+                             f"4. 分類和價位都要改\n\n"
+                             f"輸入 1~4"
+                    ))
+
                 except Exception as e:
-                    print(f'Upload error: {e}')
-                    reply(reply_token, '❌ 照片上傳失敗，請再試一次')
+                    print(f'Error: {e}')
+                    reply(reply_token, '❌ 處理失敗，請再試一次')
+
             elif state == State.EDIT_IMAGE:
                 rid = states.get_data(user_id).get('edit_id')
-                image_content = line_bot_api.get_message_content(event.message.id)
                 try:
-                    image_url = upload_image(image_content, event.message.id)
+                    image_url = upload_image(image_bytes, event.message.id)
                     db.update_image(rid, user_id, image_url)
                     states.reset(user_id)
                     reply(reply_token, '✅ 照片已更新！')
                 except Exception as e:
-                    print(f'Upload error: {e}')
+                    print(f'Error: {e}')
                     reply(reply_token, '❌ 照片上傳失敗，請再試一次')
             else:
                 reply(reply_token, '目前不需要照片，輸入「說明」查看功能')
@@ -110,7 +139,6 @@ def callback():
             continue
         msg = event.message.text.strip()
 
-        # 任何時候都能觸發
         if msg == '取消':
             states.reset(user_id)
             reply(reply_token, '已取消，輸入「說明」查看功能')
@@ -119,6 +147,32 @@ def callback():
         if msg in ('說明', 'help'):
             reply(reply_token, introduction())
             states.reset(user_id)
+            continue
+
+        # ── AI 確認流程 ───────────────────────────────────────────────────────
+        if state == State.WAIT_AI_CONFIRM and msg.isdigit():
+            choice = int(msg)
+            data = states.get_data(user_id)
+
+            if choice == 1:
+                # 直接用 AI 結果
+                states.set_data(user_id, 'category', data['ai_category'])
+                states.set_data(user_id, 'price_range', data['ai_price'])
+                states.set(user_id, State.WAIT_REVIEW)
+                reply(reply_token, '✅ 好！最後請輸入一句【評論】\n例如：滷肉飯超香，CP 值超高！')
+            elif choice == 2:
+                states.set(user_id, State.WAIT_CATEGORY)
+                reply(reply_token, CATEGORY_MENU)
+            elif choice == 3:
+                # 分類用 AI 的，只改價位
+                states.set_data(user_id, 'category', data['ai_category'])
+                states.set(user_id, State.WAIT_PRICE)
+                reply(reply_token, PRICE_MENU)
+            elif choice == 4:
+                states.set(user_id, State.WAIT_CATEGORY)
+                reply(reply_token, CATEGORY_MENU)
+            else:
+                reply(reply_token, '請輸入 1~4')
             continue
 
         # ── 分享流程 ──────────────────────────────────────────────────────────
@@ -138,14 +192,13 @@ def callback():
                       f"⚠️ 「{msg}」已經有人分享過了！\n\n"
                       f"🏷️ {existing.get('category','')}\n"
                       f"💬 「{existing['review']}」\n\n"
-                      f"你的按讚會直接加到這筆資料上。\n\n"
                       f"1. 幫這家店按讚 👍\n"
                       f"2. 還是要另外新增\n\n"
                       f"輸入 1 或 2")
             else:
                 states.set_data(user_id, 'name', msg)
-                states.set(user_id, State.WAIT_CATEGORY)
-                reply(reply_token, f'✅ 店家名稱：{msg}\n\n' + CATEGORY_MENU)
+                states.set(user_id, State.WAIT_IMAGE)
+                reply(reply_token, f'✅ 店家名稱：{msg}\n\n請上傳一張【食物照片】📷\n（AI 會自動辨識分類和價位）')
             continue
 
         if state == State.WAIT_DUP_CONFIRM and msg.isdigit():
@@ -160,8 +213,8 @@ def callback():
                 else:
                     reply(reply_token, f"已收回「{r['name']}」的讚")
             elif choice == 2:
-                states.set(user_id, State.WAIT_CATEGORY)
-                reply(reply_token, CATEGORY_MENU)
+                states.set(user_id, State.WAIT_IMAGE)
+                reply(reply_token, '請上傳一張【食物照片】📷\n（AI 會自動辨識分類和價位）')
             else:
                 reply(reply_token, '請輸入 1 或 2')
             continue
@@ -170,8 +223,15 @@ def callback():
             idx = int(msg) - 1
             if 0 <= idx < len(CATEGORIES):
                 states.set_data(user_id, 'category', CATEGORIES[idx])
-                states.set(user_id, State.WAIT_PRICE)
-                reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n' + PRICE_MENU)
+                # 看看是從 AI 確認來的還是分享流程來的
+                data = states.get_data(user_id)
+                if data.get('price_range'):
+                    # 已有價位，直接去評論
+                    states.set(user_id, State.WAIT_REVIEW)
+                    reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n請輸入一句【評論】')
+                else:
+                    states.set(user_id, State.WAIT_PRICE)
+                    reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n' + PRICE_MENU)
             else:
                 reply(reply_token, CATEGORY_MENU)
             continue
@@ -180,8 +240,8 @@ def callback():
             idx = int(msg) - 1
             if 0 <= idx < len(PRICE_RANGES):
                 states.set_data(user_id, 'price_range', PRICE_RANGES[idx])
-                states.set(user_id, State.WAIT_IMAGE)
-                reply(reply_token, f'✅ 價位：{PRICE_RANGES[idx]}\n\n請上傳一張【食物照片】📷')
+                states.set(user_id, State.WAIT_REVIEW)
+                reply(reply_token, f'✅ 價位：{PRICE_RANGES[idx]}\n\n請輸入一句【評論】\n例如：滷肉飯超香，CP 值超高！')
             else:
                 reply(reply_token, PRICE_MENU)
             continue
@@ -227,10 +287,8 @@ def callback():
         if state == State.FILTER_PICK and msg.isdigit():
             idx = int(msg) - 1
             if msg == '8' or idx == 7:
-                # 全部
                 restaurants = db.get_recent(limit=30)
                 label = '全部推薦'
-                category = None
             elif 0 <= idx < len(CATEGORIES):
                 category = CATEGORIES[idx]
                 restaurants = db.get_recent(limit=30, category=category)
@@ -238,18 +296,15 @@ def callback():
             else:
                 reply(reply_token, FILTER_MENU)
                 continue
-
             if not restaurants:
                 states.reset(user_id)
                 reply(reply_token, f'目前沒有「{label}」的分享')
                 continue
-
             states.set(user_id, State.WAIT_PICK)
             states.set_data(user_id, 'list', [r['id'] for r in restaurants])
             reply(reply_token, f'📂 {label}\n\n' + format_list(restaurants))
             continue
 
-        # ── 看店家詳情 ────────────────────────────────────────────────────────
         if state == State.WAIT_PICK and msg.isdigit():
             idx = int(msg) - 1
             id_list = states.get_data(user_id).get('list', [])
@@ -284,7 +339,7 @@ def callback():
             r = db.get_by_id(rid)
             states.reset(user_id)
             if result == 'liked':
-                reply(reply_token, f"👍 已幫「{r['name']}」按讚！\n現在共 {r['like_count']} 個讚\n\n輸入「近期推薦」或「篩選分類」繼續瀏覽")
+                reply(reply_token, f"👍 已幫「{r['name']}」按讚！\n現在共 {r['like_count']} 個讚")
             else:
                 reply(reply_token, f"已收回「{r['name']}」的讚\n現在共 {r['like_count']} 個讚")
             continue
@@ -315,7 +370,6 @@ def callback():
                           f"🏷️ {r.get('category','')}　{r.get('price_range','')}\n"
                           f"💬 「{r['review']}」\n"
                           f"👍 {r['like_count']} 個讚\n\n"
-                          f"要做什麼？\n"
                           f"1. 修改店家名稱\n"
                           f"2. 修改評論\n"
                           f"3. 修改照片\n"
@@ -424,7 +478,7 @@ def introduction() -> str:
         '📋 學生餐廳分享系統 使用說明\n'
         '━━━━━━━━━━━━━━━━━━\n'
         '📤 我要分享\n'
-        '   → 名稱→分類→價位→照片→評論\n\n'
+        '   → 名稱→照片（AI自動辨識）→評論\n\n'
         '📋 近期推薦\n'
         '   → 熱度排序，輸入編號看詳情\n\n'
         '🔍 篩選分類\n'
