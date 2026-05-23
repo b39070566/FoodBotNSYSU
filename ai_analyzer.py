@@ -4,8 +4,6 @@ from google import genai
 from google.genai import types
 from canteen_db import CATEGORIES, PRICE_RANGES
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
 PROMPT = f"""
 你是一個台灣學生餐廳推薦系統的食物辨識助手。
 請分析這張食物照片，回傳 JSON 格式（不要加任何其他文字）：
@@ -30,13 +28,19 @@ PROMPT = f"""
 
 def analyze_food_image(image_bytes: bytes) -> dict:
     try:
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+        image_part = types.Part.from_bytes(
+            data=image_bytes,
+            mime_type="image/jpeg",
+        )
+
+        # 官方文件順序：圖片在前，文字在後
         response = client.models.generate_content(
             model="gemini-2.0-flash",
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                PROMPT,
-            ]
+            contents=[image_part, PROMPT],
         )
+
         text = response.text.strip()
 
         if "```" in text:
