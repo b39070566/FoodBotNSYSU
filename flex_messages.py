@@ -1,16 +1,19 @@
-# flex_messages.py
-# 所有 Flex Message 模板
-
 from linebot.models import FlexSendMessage, BubbleContainer, BoxComponent, TextComponent, ImageComponent, ButtonComponent, SeparatorComponent
 from linebot.models.flex_message import CarouselContainer
 
 
 def restaurant_list_flex(restaurants: list) -> FlexSendMessage:
-    """推薦清單 Carousel（每筆一個 Bubble）"""
+    """推薦清單 Carousel（每筆一個 Bubble，含食物照片）"""
     bubbles = []
-    for i, r in enumerate(restaurants[:10], 1):  # Carousel 最多 12 個
+    for i, r in enumerate(restaurants[:10], 1):
         likes = r.get('like_count', 0)
         bubble = BubbleContainer(
+            hero=ImageComponent(
+                url=r['image_url'],
+                size='full',
+                aspect_ratio='20:13',
+                aspect_mode='cover',
+            ),
             body=BoxComponent(
                 layout='vertical',
                 spacing='sm',
