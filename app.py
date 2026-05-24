@@ -9,6 +9,7 @@ from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, TextMessage, ImageMessage,
     TextSendMessage, ImageSendMessage,
+    SourceGroup, SourceRoom,
 )
 
 import cloudinary
@@ -17,6 +18,12 @@ import cloudinary.uploader
 from canteen_db import CanteenDB, CATEGORIES, PRICE_RANGES
 from state_manager import StateManager, State
 from ai_analyzer import analyze_food_image
+from flex_messages import (
+    restaurant_list_flex,
+    restaurant_detail_flex,
+    share_success_flex,
+    filter_menu_flex,
+)
 
 app = Flask(__name__)
 
@@ -46,9 +53,10 @@ PRICE_MENU = "請選擇價位區間：\n" + "\n".join(
     f"{i+1}. {p}" for i, p in enumerate(PRICE_RANGES)
 ) + "\n\n輸入 1~4"
 
-FILTER_MENU = "請選擇要篩選的分類：\n" + "\n".join(
-    f"{i+1}. {c}" for i, c in enumerate(CATEGORIES)
-) + "\n8. 全部\n\n輸入 1~8"
+
+def is_group(event) -> bool:
+    """判斷是否來自群組"""
+    return isinstance(event.source, (SourceGroup, SourceRoom))
 
 
 def upload_image(image_bytes: bytes, message_id: str) -> str:
@@ -58,6 +66,15 @@ def upload_image(image_bytes: bytes, message_id: str) -> str:
         overwrite=True,
     )
     return result['secure_url']
+
+
+def reply(token, msg):
+    if isinstance(msg, str):
+        line_bot_api.reply_message(token, TextSendMessage(text=msg))
+    elif isinstance(msg, list):
+        line_bot_api.reply_message(token, msg)
+    else:
+        line_bot_api.reply_message(token, msg)
 
 
 @app.route('/callback', methods=['POST'])
@@ -74,35 +91,33 @@ def callback():
     for event in events:
         if not isinstance(event, MessageEvent):
             continue
+
         user_id = event.source.user_id
         reply_token = event.reply_token
         state = states.get(user_id)
+        group = is_group(event)
 
-        # ── 圖片訊息 ──────────────────────────────────────────────────────────
+        # ── 圖片訊息（只在私訊處理）────────────────────────────────────────
         if isinstance(event.message, ImageMessage):
+            if group:
+                continue  # 群組圖片忽略
             raw = line_bot_api.get_message_content(event.message.id)
             image_bytes = b''.join(raw.iter_content())
 
             if state == State.WAIT_IMAGE:
                 try:
-                    # 上傳圖片
                     image_url = upload_image(image_bytes, event.message.id)
                     states.set_data(user_id, 'image_url', image_url)
-
-                    # AI 辨識
                     reply(reply_token, '📷 照片收到，AI 辨識中...')
                     ai = analyze_food_image(image_bytes)
-
                     states.set_data(user_id, 'ai_category', ai['category'])
                     states.set_data(user_id, 'ai_price', ai['price_range'])
                     states.set(user_id, State.WAIT_AI_CONFIRM)
-
                     confidence_note = {
                         'high': '✅ 辨識很有把握',
                         'medium': '🔍 辨識有點把握',
                         'low': '⚠️ 辨識把握度低，建議手動修改',
                     }.get(ai['confidence'], '')
-
                     line_bot_api.push_message(user_id, TextSendMessage(
                         text=f"🤖 AI 辨識結果：\n"
                              f"🍽️ {ai['food_name']}\n"
@@ -115,7 +130,6 @@ def callback():
                              f"4. 分類和價位都要改\n\n"
                              f"輸入 1~4"
                     ))
-
                 except Exception as e:
                     print(f'Error: {e}')
                     reply(reply_token, '❌ 處理失敗，請再試一次')
@@ -139,6 +153,81 @@ def callback():
             continue
         msg = event.message.text.strip()
 
+        # ══════════════════════════════════════════════════════════════════════
+        # 群組指令（只處理查詢類）
+        # ══════════════════════════════════════════════════════════════════════
+        if group:
+            if msg == '近期推薦':
+                restaurants = db.get_recent(limit=30)
+                if not restaurants:
+                    reply(reply_token, '目前還沒有任何分享，私訊 Bot 輸入「我要分享」來新增！')
+                    continue
+                states.reset(user_id)
+                states.set(user_id, State.WAIT_PICK)
+                states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+                reply(reply_token, restaurant_list_flex(restaurants))
+                continue
+
+            if msg == '篩選分類':
+                states.reset(user_id)
+                states.set(user_id, State.FILTER_PICK)
+                reply(reply_token, filter_menu_flex())
+                continue
+
+            if msg.startswith('分類選擇 ') and msg.split()[-1].isdigit():
+                idx = int(msg.split()[-1]) - 1
+                if idx == 7:
+                    restaurants = db.get_recent(limit=30)
+                    label = '全部推薦'
+                elif 0 <= idx < len(CATEGORIES):
+                    category = CATEGORIES[idx]
+                    restaurants = db.get_recent(limit=30, category=category)
+                    label = category
+                else:
+                    continue
+                if not restaurants:
+                    reply(reply_token, f'目前沒有「{label}」的分享')
+                    continue
+                states.set(user_id, State.WAIT_PICK)
+                states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+                reply(reply_token, restaurant_list_flex(restaurants))
+                continue
+
+            if msg.startswith('詳情 ') and msg.split()[-1].isdigit():
+                idx = int(msg.split()[-1]) - 1
+                id_list = states.get_data(user_id).get('list', [])
+                if 0 <= idx < len(id_list):
+                    r = db.get_by_id(id_list[idx])
+                    if r:
+                        liked = db.has_liked(r['id'], user_id)
+                        states.set(user_id, State.WAIT_LIKE)
+                        states.set_data(user_id, 'view_id', r['id'])
+                        reply(reply_token, restaurant_detail_flex(r, liked))
+                        continue
+                reply(reply_token, '找不到這筆資料')
+                continue
+
+            if state == State.WAIT_LIKE and msg == '讚':
+                rid = states.get_data(user_id).get('view_id')
+                result = db.toggle_like(rid, user_id)
+                r = db.get_by_id(rid)
+                states.reset(user_id)
+                if result == 'liked':
+                    reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚")
+                else:
+                    reply(reply_token, f"已收回「{r['name']}」的讚，現在共 {r['like_count']} 個讚")
+                continue
+
+            if msg in ('我要分享', '管理我的分享'):
+                reply(reply_token, '請私訊 Bot 來進行這個操作 😊')
+                continue
+
+            # 群組其他訊息忽略
+            continue
+
+        # ══════════════════════════════════════════════════════════════════════
+        # 私訊指令
+        # ══════════════════════════════════════════════════════════════════════
         if msg == '取消':
             states.reset(user_id)
             reply(reply_token, '已取消，輸入「說明」查看功能')
@@ -153,18 +242,15 @@ def callback():
         if state == State.WAIT_AI_CONFIRM and msg.isdigit():
             choice = int(msg)
             data = states.get_data(user_id)
-
             if choice == 1:
-                # 直接用 AI 結果
                 states.set_data(user_id, 'category', data['ai_category'])
                 states.set_data(user_id, 'price_range', data['ai_price'])
                 states.set(user_id, State.WAIT_REVIEW)
-                reply(reply_token, '✅ 好！最後請輸入一句【評論】\n例如：滷肉飯超香，CP 值超高！')
+                reply(reply_token, '✅ 好！最後請輸入一句【評論】')
             elif choice == 2:
                 states.set(user_id, State.WAIT_CATEGORY)
                 reply(reply_token, CATEGORY_MENU)
             elif choice == 3:
-                # 分類用 AI 的，只改價位
                 states.set_data(user_id, 'category', data['ai_category'])
                 states.set(user_id, State.WAIT_PRICE)
                 reply(reply_token, PRICE_MENU)
@@ -214,7 +300,7 @@ def callback():
                     reply(reply_token, f"已收回「{r['name']}」的讚")
             elif choice == 2:
                 states.set(user_id, State.WAIT_IMAGE)
-                reply(reply_token, '請上傳一張【食物照片】📷\n（AI 會自動辨識分類和價位）')
+                reply(reply_token, '請上傳一張【食物照片】📷')
             else:
                 reply(reply_token, '請輸入 1 或 2')
             continue
@@ -223,10 +309,8 @@ def callback():
             idx = int(msg) - 1
             if 0 <= idx < len(CATEGORIES):
                 states.set_data(user_id, 'category', CATEGORIES[idx])
-                # 看看是從 AI 確認來的還是分享流程來的
                 data = states.get_data(user_id)
                 if data.get('price_range'):
-                    # 已有價位，直接去評論
                     states.set(user_id, State.WAIT_REVIEW)
                     reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n請輸入一句【評論】')
                 else:
@@ -241,7 +325,7 @@ def callback():
             if 0 <= idx < len(PRICE_RANGES):
                 states.set_data(user_id, 'price_range', PRICE_RANGES[idx])
                 states.set(user_id, State.WAIT_REVIEW)
-                reply(reply_token, f'✅ 價位：{PRICE_RANGES[idx]}\n\n請輸入一句【評論】\n例如：滷肉飯超香，CP 值超高！')
+                reply(reply_token, f'✅ 價位：{PRICE_RANGES[idx]}\n\n請輸入一句【評論】')
             else:
                 reply(reply_token, PRICE_MENU)
             continue
@@ -257,15 +341,10 @@ def callback():
                 review=msg,
             )
             states.reset(user_id)
-            reply(reply_token,
-                  f"🎉 分享成功！\n\n"
-                  f"📍 {data['name']}\n"
-                  f"🏷️ {data['category']}　{data['price_range']}\n"
-                  f"💬 「{msg}」\n\n"
-                  f"其他同學可以輸入「近期推薦」查看！")
+            reply(reply_token, share_success_flex(data['name'], data['category'], data['price_range'], msg))
             continue
 
-        # ── 近期推薦 ──────────────────────────────────────────────────────────
+        # ── 近期推薦（私訊）──────────────────────────────────────────────────
         if msg == '近期推薦':
             restaurants = db.get_recent(limit=30)
             if not restaurants:
@@ -274,19 +353,19 @@ def callback():
             states.reset(user_id)
             states.set(user_id, State.WAIT_PICK)
             states.set_data(user_id, 'list', [r['id'] for r in restaurants])
-            reply(reply_token, format_list(restaurants))
+            reply(reply_token, restaurant_list_flex(restaurants))
             continue
 
-        # ── 篩選分類 ──────────────────────────────────────────────────────────
+        # ── 篩選分類（私訊）──────────────────────────────────────────────────
         if msg == '篩選分類':
             states.reset(user_id)
             states.set(user_id, State.FILTER_PICK)
-            reply(reply_token, FILTER_MENU)
+            reply(reply_token, filter_menu_flex())
             continue
 
-        if state == State.FILTER_PICK and msg.isdigit():
-            idx = int(msg) - 1
-            if msg == '8' or idx == 7:
+        if msg.startswith('分類選擇 ') and msg.split()[-1].isdigit():
+            idx = int(msg.split()[-1]) - 1
+            if idx == 7:
                 restaurants = db.get_recent(limit=30)
                 label = '全部推薦'
             elif 0 <= idx < len(CATEGORIES):
@@ -294,7 +373,7 @@ def callback():
                 restaurants = db.get_recent(limit=30, category=category)
                 label = category
             else:
-                reply(reply_token, FILTER_MENU)
+                reply(reply_token, '請重新選擇')
                 continue
             if not restaurants:
                 states.reset(user_id)
@@ -302,11 +381,11 @@ def callback():
                 continue
             states.set(user_id, State.WAIT_PICK)
             states.set_data(user_id, 'list', [r['id'] for r in restaurants])
-            reply(reply_token, f'📂 {label}\n\n' + format_list(restaurants))
+            reply(reply_token, restaurant_list_flex(restaurants))
             continue
 
-        if state == State.WAIT_PICK and msg.isdigit():
-            idx = int(msg) - 1
+        if msg.startswith('詳情 ') and msg.split()[-1].isdigit():
+            idx = int(msg.split()[-1]) - 1
             id_list = states.get_data(user_id).get('list', [])
             if 0 <= idx < len(id_list):
                 r = db.get_by_id(id_list[idx])
@@ -314,23 +393,9 @@ def callback():
                     liked = db.has_liked(r['id'], user_id)
                     states.set(user_id, State.WAIT_LIKE)
                     states.set_data(user_id, 'view_id', r['id'])
-                    heart = '❤️' if liked else '🤍'
-                    line_bot_api.reply_message(reply_token, [
-                        ImageSendMessage(
-                            original_content_url=r['image_url'],
-                            preview_image_url=r['image_url'],
-                        ),
-                        TextSendMessage(
-                            text=f"📍 {r['name']}\n"
-                                 f"🏷️ {r.get('category','')}　{r.get('price_range','')}\n"
-                                 f"💬 「{r['review']}」\n"
-                                 f"👍 {r['like_count']} 個讚\n\n"
-                                 f"輸入「讚」{heart} 按讚／收回讚\n"
-                                 f"輸入「近期推薦」或「篩選分類」繼續瀏覽"
-                        ),
-                    ])
+                    reply(reply_token, restaurant_detail_flex(r, liked))
                     continue
-            reply(reply_token, '請輸入有效的編號')
+            reply(reply_token, '找不到這筆資料')
             continue
 
         if state == State.WAIT_LIKE and msg == '讚':
@@ -339,9 +404,9 @@ def callback():
             r = db.get_by_id(rid)
             states.reset(user_id)
             if result == 'liked':
-                reply(reply_token, f"👍 已幫「{r['name']}」按讚！\n現在共 {r['like_count']} 個讚")
+                reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚")
             else:
-                reply(reply_token, f"已收回「{r['name']}」的讚\n現在共 {r['like_count']} 個讚")
+                reply(reply_token, f"已收回「{r['name']}」的讚，現在共 {r['like_count']} 個讚")
             continue
 
         # ── 管理我的分享 ──────────────────────────────────────────────────────
@@ -370,13 +435,8 @@ def callback():
                           f"🏷️ {r.get('category','')}　{r.get('price_range','')}\n"
                           f"💬 「{r['review']}」\n"
                           f"👍 {r['like_count']} 個讚\n\n"
-                          f"1. 修改店家名稱\n"
-                          f"2. 修改評論\n"
-                          f"3. 修改照片\n"
-                          f"4. 修改分類\n"
-                          f"5. 修改價位\n"
-                          f"6. 刪除這筆分享\n\n"
-                          f"輸入 1~6")
+                          f"1. 修改店家名稱\n2. 修改評論\n3. 修改照片\n"
+                          f"4. 修改分類\n5. 修改價位\n6. 刪除這筆分享\n\n輸入 1~6")
                     continue
             reply(reply_token, '請輸入有效的編號')
             continue
@@ -448,23 +508,6 @@ def callback():
     return 'OK'
 
 
-def reply(token, text_or_list):
-    if isinstance(text_or_list, str):
-        line_bot_api.reply_message(token, TextSendMessage(text=text_or_list))
-    else:
-        line_bot_api.reply_message(token, text_or_list)
-
-
-def format_list(restaurants: list) -> str:
-    lines = ['🍽️ 推薦清單（按讚數＋新鮮度排序）\n']
-    for i, r in enumerate(restaurants, 1):
-        likes = r.get('like_count', 0)
-        heart = f" 👍{likes}" if likes > 0 else ""
-        lines.append(f"{i}. {r['name']}　{r.get('category','')}　{r.get('price_range','')}{heart}")
-    lines.append('\n👉 輸入編號查看照片與評論')
-    return '\n'.join(lines)
-
-
 def format_my_list(restaurants: list) -> str:
     lines = ['📋 我的分享（輸入編號選擇要管理的）\n']
     for i, r in enumerate(restaurants, 1):
@@ -477,13 +520,13 @@ def introduction() -> str:
     return (
         '📋 學生餐廳分享系統 使用說明\n'
         '━━━━━━━━━━━━━━━━━━\n'
-        '📤 我要分享\n'
-        '   → 名稱→照片（AI自動辨識）→評論\n\n'
-        '📋 近期推薦\n'
-        '   → 熱度排序，輸入編號看詳情\n\n'
-        '🔍 篩選分類\n'
+        '📤 我要分享（私訊）\n'
+        '   → 名稱→照片（AI辨識）→評論\n\n'
+        '📋 近期推薦（私訊或群組）\n'
+        '   → Flex 卡片，點「查看詳情」\n\n'
+        '🔍 篩選分類（私訊或群組）\n'
         '   → 選分類後看該分類推薦\n\n'
-        '✏️ 管理我的分享\n'
+        '✏️ 管理我的分享（私訊）\n'
         '   → 修改或刪除自己的貼文\n\n'
         '❌ 取消　　📖 說明'
     )
