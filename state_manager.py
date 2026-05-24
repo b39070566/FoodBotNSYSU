@@ -9,7 +9,7 @@ class State(Enum):
     WAIT_CATEGORY = auto()
     WAIT_PRICE = auto()
     WAIT_IMAGE = auto()
-    WAIT_AI_CONFIRM = auto()   # 新增：確認 AI 辨識結果
+    WAIT_AI_CONFIRM = auto()
     WAIT_REVIEW = auto()
     WAIT_PICK = auto()
     WAIT_LIKE = auto()
@@ -18,9 +18,10 @@ class State(Enum):
     MANAGE_ACTION = auto()
     EDIT_NAME = auto()
     EDIT_REVIEW = auto()
-    EDIT_IMAGE = auto()
     EDIT_CATEGORY = auto()
     EDIT_PRICE = auto()
+    ADD_PHOTO = auto()       # 新增照片
+    WAIT_COMMENT = auto()    # 留評論
 
 
 class StateManager:
