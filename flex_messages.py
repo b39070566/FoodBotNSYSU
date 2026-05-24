@@ -42,7 +42,7 @@ def restaurant_list_flex(restaurants: list) -> FlexSendMessage:
             hero=ImageComponent(
                 url=image_url,
                 size='full',
-                aspect_ratio='20:13',
+                aspect_ratio='4:3',
                 aspect_mode='cover',
             ) if image_url else None,
             body=BoxComponent(layout='vertical', spacing='sm', contents=contents),
@@ -91,7 +91,7 @@ def restaurant_detail_flex(restaurant: dict, user_has_liked: bool, comments: lis
         hero=ImageComponent(
             url=image_url,
             size='full',
-            aspect_ratio='20:13',
+            aspect_ratio='4:3',
             aspect_mode='cover',
         ) if image_url else None,
         body=BoxComponent(
