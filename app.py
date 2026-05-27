@@ -215,33 +215,128 @@ def callback():
 
         # ── 管理員指令 ────────────────────────────────────────────────────────
         if not group and is_admin(user_id):
-            if msg.startswith('刪照片 ') and msg.split()[-1].isdigit():
-                reply(reply_token, f'✅ 照片已永久刪除' if db.admin_delete_photo(int(msg.split()[-1])) else '找不到這張照片')
-                continue
-            if msg.startswith('恢復照片 ') and msg.split()[-1].isdigit():
-                reply(reply_token, f'✅ 照片已恢復上架' if db.admin_restore_photo(int(msg.split()[-1])) else '找不到這張照片')
-                continue
-            if msg.startswith('刪店家 ') and msg.split()[-1].isdigit():
-                # 直接隱藏而非刪除，保留資料
-                rid = int(msg.split()[-1])
-                db.admin_restore_restaurant(rid)  # 先用恢復函式，後面可加刪除
-                reply(reply_token, f'✅ 已處理')
-                continue
-            if msg.startswith('恢復店家 ') and msg.split()[-1].isdigit():
-                reply(reply_token, f'✅ 店家已恢復上架' if db.admin_restore_restaurant(int(msg.split()[-1])) else '找不到這家店')
-                continue
+            parts = msg.split()
+            cmd = parts[0] if parts else ''
+            arg = int(parts[-1]) if len(parts) > 1 and parts[-1].isdigit() else None
+
+            # ── 查詢 ──
             if msg == '待審核':
                 data = db.admin_get_reported()
                 lines = []
                 if data['restaurants']:
                     lines.append('🚩 待審核店家：')
                     for r in data['restaurants']:
-                        lines.append(f"ID:{r['id']} {r['name']} {r['report_count']}個檢舉 [{r['status']}]")
+                        st = '⚠️待審核' if r['status'] == 'pending_review' else '🚫下架'
+                        lines.append(f"ID:{r['id']} {st} {r['report_count']}檢舉 {r['name']}")
                 if data['photos']:
                     lines.append('\n🚩 待審核照片：')
                     for p in data['photos']:
-                        lines.append(f"ID:{p['id']} {p['restaurant_name']} {p['report_count']}個檢舉 [{p['status']}]")
+                        st = '⚠️待審核' if p['status'] == 'pending_review' else '🚫下架'
+                        lines.append(f"ID:{p['id']} {st} {p['report_count']}檢舉 {p['restaurant_name']}")
                 reply(reply_token, '\n'.join(lines) if lines else '目前沒有待審核項目 ✅')
+                continue
+
+            if cmd == '查店家' and arg:
+                r = db.admin_get_restaurant(arg)
+                if not r:
+                    reply(reply_token, '找不到這家店')
+                else:
+                    status_map = {'active': '✅正常', 'pending_review': '⚠️待審核', 'hidden': '🚫下架'}
+                    lines = [
+                        f"📍 {r['name']} (ID:{r['id']})",
+                        f"狀態：{status_map.get(r['status'], r['status'])}　檢舉數：{r['report_count']}",
+                        f"🏷️ {r.get('category','')}　{r.get('price_range','')}",
+                        f"💬 {r['review']}",
+                        f"👁 {r['view_count']}人　👍 {r['like_count']}讚　💬 {r['comment_count']}則評論",
+                        f"📷 {r['photo_count']}張照片",
+                        f"建立：{r['created_at']}",
+                        f"\n指令：隱藏店家 {arg} / 刪店家 {arg} / 恢復店家 {arg}",
+                        f"查評論 {arg}",
+                    ]
+                    reply(reply_token, '\n'.join(lines))
+                continue
+
+            if cmd == '查照片' and arg:
+                p = db.admin_get_photo(arg)
+                if not p:
+                    reply(reply_token, '找不到這張照片')
+                else:
+                    status_map = {'active': '✅正常', 'pending_review': '⚠️待審核', 'hidden': '🚫下架'}
+                    lines = [
+                        f"📷 照片 ID:{p['id']}",
+                        f"餐廳：{p['restaurant_name']} (ID:{p['restaurant_id']})",
+                        f"狀態：{status_map.get(p['status'], p['status'])}　檢舉數：{p['report_count']}",
+                        f"👍 {p['like_count']}個讚",
+                        f"上傳：{p['uploaded_at']}",
+                        f"\n指令：刪照片 {arg} / 恢復照片 {arg}",
+                    ]
+                    reply(reply_token, '\n'.join(lines))
+                continue
+
+            if cmd == '查評論' and arg:
+                comments = db.admin_get_comments(arg)
+                if not comments:
+                    reply(reply_token, f'店家 {arg} 目前沒有評論')
+                else:
+                    lines = [f'💬 店家 {arg} 的評論（共{len(comments)}則）\n']
+                    for c in comments:
+                        lines.append(f"ID:{c['id']} {c['created_at'][:10]}\n{c['content']}")
+                    lines.append(f"\n刪評論 ID")
+                    reply(reply_token, '\n'.join(lines))
+                continue
+
+            # ── 店家管理 ──
+            if cmd == '隱藏店家' and arg:
+                reply(reply_token, f'✅ 店家 {arg} 已暫時下架' if db.admin_hide_restaurant(arg) else '找不到這家店')
+                continue
+
+            if cmd == '刪店家' and arg:
+                r = db.admin_get_restaurant(arg)
+                name = r['name'] if r else str(arg)
+                if db.admin_delete_restaurant(arg):
+                    reply(reply_token, f'🗑️ 店家「{name}」已永久刪除（含所有照片、按讚、評論）')
+                else:
+                    reply(reply_token, '找不到這家店')
+                continue
+
+            if cmd == '恢復店家' and arg:
+                reply(reply_token, f'✅ 店家 {arg} 已恢復上架' if db.admin_restore_restaurant(arg) else '找不到這家店')
+                continue
+
+            # ── 照片管理 ──
+            if cmd == '刪照片' and arg:
+                reply(reply_token, f'✅ 照片 {arg} 已永久刪除' if db.admin_delete_photo(arg) else '找不到這張照片')
+                continue
+
+            if cmd == '恢復照片' and arg:
+                reply(reply_token, f'✅ 照片 {arg} 已恢復上架' if db.admin_restore_photo(arg) else '找不到這張照片')
+                continue
+
+            # ── 評論管理 ──
+            if cmd == '刪評論' and arg:
+                reply(reply_token, f'✅ 評論 {arg} 已刪除' if db.admin_delete_comment(arg) else '找不到這則評論')
+                continue
+
+            if msg == '管理說明':
+                admin_help = (
+                    '🔧 管理員指令\n'
+                    '━━━━━━━━━━━━━━━━━━\n'
+                    '📋 查詢\n'
+                    '  待審核\n'
+                    '  查店家 ID\n'
+                    '  查照片 ID\n'
+                    '  查評論 ID（店家ID）\n\n'
+                    '🏪 店家\n'
+                    '  隱藏店家 ID\n'
+                    '  刪店家 ID\n'
+                    '  恢復店家 ID\n\n'
+                    '📷 照片\n'
+                    '  刪照片 ID\n'
+                    '  恢復照片 ID\n\n'
+                    '💬 評論\n'
+                    '  刪評論 ID'
+                )
+                reply(reply_token, admin_help)
                 continue
 
         # ══════════════════════════════════════════════════════════════════════

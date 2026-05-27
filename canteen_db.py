@@ -471,3 +471,76 @@ class CanteenDB:
     def update_review(self, rid, uid, v): return self._update("review", rid, uid, v)
     def update_category(self, rid, uid, v): return self._update("category", rid, uid, v)
     def update_price_range(self, rid, uid, v): return self._update("price_range", rid, uid, v)
+
+    # ── 管理員完整功能（補充）────────────────────────────────────────────────
+    def admin_delete_restaurant(self, restaurant_id: int) -> bool:
+        """永久刪除店家（連同所有照片、按讚、評論，CASCADE 自動處理）"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM restaurants WHERE id=%s", (restaurant_id,))
+                conn.commit()
+                return cur.rowcount > 0
+
+    def admin_hide_restaurant(self, restaurant_id: int) -> bool:
+        """暫時下架但保留資料"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE restaurants SET status='hidden' WHERE id=%s", (restaurant_id,))
+                conn.commit()
+                return cur.rowcount > 0
+
+    def admin_get_restaurant(self, restaurant_id: int) -> Optional[dict]:
+        """查看店家完整資訊（含隱藏狀態）"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM restaurants WHERE id=%s", (restaurant_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                r = dict(row)
+                r["like_count"] = self._like_count(restaurant_id)
+                r["comment_count"] = self._comment_count(restaurant_id)
+                r["view_count"] = self._view_count(restaurant_id)
+                photos = self._get_all_photos(restaurant_id, cur, include_hidden=True)
+                r["photo_count"] = len(photos)
+                r["photos"] = photos
+                if isinstance(r.get("created_at"), datetime):
+                    r["created_at"] = r["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                return r
+
+    def admin_get_photo(self, photo_id: int) -> Optional[dict]:
+        """查看照片完整資訊"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT p.*, r.name as restaurant_name
+                    FROM photos p JOIN restaurants r ON p.restaurant_id=r.id
+                    WHERE p.id=%s
+                """, (photo_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                result = dict(row)
+                result["like_count"] = self._photo_like_count(photo_id, cur)
+                return result
+
+    def admin_get_comments(self, restaurant_id: int) -> list[dict]:
+        """取得店家所有評論"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM comments WHERE restaurant_id=%s ORDER BY created_at DESC",
+                    (restaurant_id,)
+                )
+                rows = [dict(r) for r in cur.fetchall()]
+                for r in rows:
+                    if isinstance(r.get("created_at"), datetime):
+                        r["created_at"] = r["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+                return rows
+
+    def admin_delete_comment(self, comment_id: int) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM comments WHERE id=%s", (comment_id,))
+                conn.commit()
+                return cur.rowcount > 0
