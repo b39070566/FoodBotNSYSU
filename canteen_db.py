@@ -1,12 +1,13 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from urllib.parse import urlparse
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 MAX_RESTAURANTS = 30
-MAX_PHOTOS = 5
+MAX_PHOTOS = 10
+PHOTO_PROTECT_DAYS = 7  # 新照片保護期
 
 CATEGORIES = [
     "🍱 便當／快餐",
@@ -58,7 +59,6 @@ class CanteenDB:
                         category    TEXT NOT NULL DEFAULT '其他',
                         price_range TEXT NOT NULL DEFAULT '',
                         review      TEXT NOT NULL,
-                        views       INTEGER NOT NULL DEFAULT 0,
                         created_at  TIMESTAMP NOT NULL DEFAULT NOW()
                     )
                 """)
@@ -98,39 +98,71 @@ class CanteenDB:
                         created_at    TIMESTAMP NOT NULL DEFAULT NOW()
                     )
                 """)
-                # 舊資料相容
-                for sql in [
-                    "ALTER TABLE restaurants ADD COLUMN IF NOT EXISTS views INTEGER NOT NULL DEFAULT 0",
-                    "ALTER TABLE restaurants DROP COLUMN IF EXISTS image_url",
-                ]:
-                    try:
-                        cur.execute(sql)
-                    except Exception:
-                        pass
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS views_log (
+                        restaurant_id INTEGER NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+                        user_id       TEXT NOT NULL,
+                        UNIQUE(restaurant_id, user_id)
+                    )
+                """)
             conn.commit()
 
-    # ── 照片分數計算 ──────────────────────────────────────────────────────────
-    def _photo_score(self, photo_id: int, cur) -> float:
+    # ── 照片分數 ──────────────────────────────────────────────────────────────
+    def _photo_score(self, photo_id: int, uploaded_at: datetime, cur) -> float:
+        """
+        照片分數 = 按讚時間衰減 × 0.8 + 照片新鮮度 × 0.2
+        新照片（7天內）不受刪除影響
+        """
         cur.execute("SELECT liked_at FROM photo_likes WHERE photo_id=%s", (photo_id,))
         rows = cur.fetchall()
         now = datetime.now()
-        score = 0.0
+
+        like_score = 0.0
         for r in rows:
             days = max((now - r["liked_at"]).total_seconds() / 86400, 0)
-            score += 1.0 / (days + 1)
-        return score
+            like_score += 1.0 / (days + 1)
 
-    def _get_main_photo(self, restaurant_id: int, cur) -> Optional[dict]:
-        """取得分數最高的照片當主圖，沒照片回 None"""
+        # 照片新鮮度
+        age_days = max((now - uploaded_at).total_seconds() / 86400, 0)
+        freshness = 1.0 / (age_days + 1)
+
+        return like_score * 0.8 + freshness * 0.2
+
+    def _get_all_photos(self, restaurant_id: int, cur) -> list[dict]:
         cur.execute(
             "SELECT * FROM photos WHERE restaurant_id=%s ORDER BY uploaded_at DESC",
             (restaurant_id,)
         )
-        photos = cur.fetchall()
+        photos = [dict(r) for r in cur.fetchall()]
+        for p in photos:
+            p["score"] = self._photo_score(p["id"], p["uploaded_at"], cur)
+            p["like_count"] = self._photo_like_count(p["id"], cur)
+        return photos
+
+    def _get_main_photo(self, restaurant_id: int, cur) -> Optional[dict]:
+        """分數最高的照片當主圖"""
+        photos = self._get_all_photos(restaurant_id, cur)
         if not photos:
             return None
-        best = max(photos, key=lambda p: self._photo_score(p["id"], cur))
-        return dict(best)
+        return max(photos, key=lambda p: p["score"])
+
+    def _photo_like_count(self, photo_id: int, cur) -> int:
+        cur.execute("SELECT COUNT(*) as cnt FROM photo_likes WHERE photo_id=%s", (photo_id,))
+        return cur.fetchone()["cnt"]
+
+    # ── 餐廳推薦分數（按讚時間衰減 + 新鮮度）────────────────────────────────
+    def _restaurant_score(self, restaurant_id: int, created_at: datetime, likes_rows: list) -> float:
+        now = datetime.now()
+        like_score = 0.0
+        for like in likes_rows:
+            if like["restaurant_id"] == restaurant_id:
+                days = max((now - like["liked_at"]).total_seconds() / 86400, 0)
+                like_score += 1.0 / (days + 1)
+
+        age_days = max((now - created_at).total_seconds() / 86400, 0)
+        freshness = 1.0 / (age_days + 1)
+
+        return like_score * 0.7 + freshness * 0.3
 
     # ── 新增餐廳 ──────────────────────────────────────────────────────────────
     def add_restaurant(self, user_id, name, category, price_range, image_url, review) -> int:
@@ -142,12 +174,10 @@ class CanteenDB:
                     (user_id, name, category, price_range, review)
                 )
                 new_id = cur.fetchone()["id"]
-                # 新增第一張照片
                 cur.execute(
                     "INSERT INTO photos (restaurant_id, user_id, image_url) VALUES (%s,%s,%s)",
                     (new_id, user_id, image_url)
                 )
-                # 超過上限刪最舊
                 cur.execute("SELECT COUNT(*) as cnt FROM restaurants")
                 count = cur.fetchone()["cnt"]
                 if count > MAX_RESTAURANTS:
@@ -161,18 +191,24 @@ class CanteenDB:
 
     # ── 新增照片 ──────────────────────────────────────────────────────────────
     def add_photo(self, restaurant_id: int, user_id: str, image_url: str):
-        """新增照片，超過5張刪分數最低的"""
+        """
+        新增照片，超過10張時：
+        - 保護7天內的新照片
+        - 刪分數最低且不在保護期的照片
+        - 若全部都在保護期，刪分數最低的（無論新舊）
+        """
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM photos WHERE restaurant_id=%s",
-                    (restaurant_id,)
-                )
-                photos = cur.fetchall()
+                photos = self._get_all_photos(restaurant_id, cur)
                 if len(photos) >= MAX_PHOTOS:
-                    # 找分數最低的刪掉
-                    worst = min(photos, key=lambda p: self._photo_score(p["id"], cur))
+                    now = datetime.now()
+                    protect_cutoff = now - timedelta(days=PHOTO_PROTECT_DAYS)
+                    # 找不在保護期的照片
+                    unprotected = [p for p in photos if p["uploaded_at"] < protect_cutoff]
+                    candidates = unprotected if unprotected else photos
+                    worst = min(candidates, key=lambda p: p["score"])
                     cur.execute("DELETE FROM photos WHERE id=%s", (worst["id"],))
+
                 cur.execute(
                     "INSERT INTO photos (restaurant_id, user_id, image_url) VALUES (%s,%s,%s)",
                     (restaurant_id, user_id, image_url)
@@ -184,33 +220,28 @@ class CanteenDB:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 if category:
-                    cur.execute("SELECT * FROM restaurants WHERE category=%s ORDER BY id DESC", (category,))
+                    cur.execute("SELECT * FROM restaurants WHERE category=%s", (category,))
                 else:
-                    cur.execute("SELECT * FROM restaurants ORDER BY id DESC")
+                    cur.execute("SELECT * FROM restaurants")
                 restaurants = [dict(r) for r in cur.fetchall()]
 
                 cur.execute("SELECT restaurant_id, liked_at FROM likes")
                 likes_rows = cur.fetchall()
 
-        now = datetime.now()
-        like_map: dict[int, float] = {}
-        for like in likes_rows:
-            rid = like["restaurant_id"]
-            days = max((now - like["liked_at"]).total_seconds() / 86400, 0)
-            like_map[rid] = like_map.get(rid, 0) + 1.0 / (days + 1)
-
         with self._connect() as conn:
             with conn.cursor() as cur:
                 for r in restaurants:
-                    r["like_score"] = like_map.get(r["id"], 0)
+                    r["score"] = self._restaurant_score(r["id"], r["created_at"], likes_rows)
                     r["like_count"] = self._like_count(r["id"])
                     r["comment_count"] = self._comment_count(r["id"])
+                    r["view_count"] = self._view_count(r["id"])
                     main = self._get_main_photo(r["id"], cur)
                     r["image_url"] = main["image_url"] if main else None
+                    r["photo_count"] = len(self._get_all_photos(r["id"], cur))
                     if isinstance(r.get("created_at"), datetime):
                         r["created_at"] = r["created_at"].strftime("%Y-%m-%d %H:%M:%S")
 
-        restaurants.sort(key=lambda x: x["like_score"], reverse=True)
+        restaurants.sort(key=lambda x: x["score"], reverse=True)
         return restaurants[:limit]
 
     def get_by_id(self, restaurant_id: int) -> Optional[dict]:
@@ -223,9 +254,12 @@ class CanteenDB:
                 r = dict(row)
                 r["like_count"] = self._like_count(restaurant_id)
                 r["comment_count"] = self._comment_count(restaurant_id)
-                main = self._get_main_photo(restaurant_id, cur)
+                r["view_count"] = self._view_count(restaurant_id)
+                photos = self._get_all_photos(restaurant_id, cur)
+                main = max(photos, key=lambda p: p["score"]) if photos else None
                 r["image_url"] = main["image_url"] if main else None
-                r["photo_count"] = self._photo_count(restaurant_id, cur)
+                r["photo_count"] = len(photos)
+                r["photos"] = photos  # 全部照片資訊
                 if isinstance(r.get("created_at"), datetime):
                     r["created_at"] = r["created_at"].strftime("%Y-%m-%d %H:%M:%S")
                 return r
@@ -252,33 +286,39 @@ class CanteenDB:
                 r["image_url"] = main["image_url"] if main else None
                 return r
 
-    def _like_count(self, restaurant_id: int) -> int:
+    def _like_count(self, rid: int) -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) as cnt FROM likes WHERE restaurant_id=%s", (restaurant_id,))
+                cur.execute("SELECT COUNT(*) as cnt FROM likes WHERE restaurant_id=%s", (rid,))
                 return cur.fetchone()["cnt"]
 
-    def _comment_count(self, restaurant_id: int) -> int:
+    def _comment_count(self, rid: int) -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) as cnt FROM comments WHERE restaurant_id=%s", (restaurant_id,))
+                cur.execute("SELECT COUNT(*) as cnt FROM comments WHERE restaurant_id=%s", (rid,))
                 return cur.fetchone()["cnt"]
 
-    def _photo_count(self, restaurant_id: int, cur) -> int:
-        cur.execute("SELECT COUNT(*) as cnt FROM photos WHERE restaurant_id=%s", (restaurant_id,))
-        return cur.fetchone()["cnt"]
-
-    # ── 觀看數 ────────────────────────────────────────────────────────────────
-    def increment_views(self, restaurant_id: int):
+    def _view_count(self, rid: int) -> int:
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE restaurants SET views=views+1 WHERE id=%s",
-                    (restaurant_id,)
-                )
-            conn.commit()
+                cur.execute("SELECT COUNT(*) as cnt FROM views_log WHERE restaurant_id=%s", (rid,))
+                return cur.fetchone()["cnt"]
 
-    # ── 按讚 ──────────────────────────────────────────────────────────────────
+    # ── 觀看數（不重複）──────────────────────────────────────────────────────
+    def log_view(self, restaurant_id: int, user_id: str):
+        """同一人同一店只記一次"""
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "INSERT INTO views_log (restaurant_id, user_id) VALUES (%s,%s)",
+                        (restaurant_id, user_id)
+                    )
+                    conn.commit()
+                except Exception:
+                    pass  # UNIQUE 衝突就忽略
+
+    # ── 店家按讚 ──────────────────────────────────────────────────────────────
     def toggle_like(self, restaurant_id: int, user_id: str) -> str:
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -287,25 +327,13 @@ class CanteenDB:
                     (restaurant_id, user_id)
                 )
                 if cur.fetchone():
-                    cur.execute("DELETE FROM likes WHERE restaurant_id=%s AND user_id=%s", (restaurant_id, user_id))
-                    # 同步移除對應照片的按讚
-                    main = self._get_main_photo(restaurant_id, cur)
-                    if main:
-                        cur.execute("DELETE FROM photo_likes WHERE photo_id=%s AND user_id=%s", (main["id"], user_id))
+                    cur.execute("DELETE FROM likes WHERE restaurant_id=%s AND user_id=%s",
+                                (restaurant_id, user_id))
                     conn.commit()
                     return "unliked"
                 else:
-                    cur.execute("INSERT INTO likes (restaurant_id, user_id) VALUES (%s,%s)", (restaurant_id, user_id))
-                    # 同步對當下主圖按讚
-                    main = self._get_main_photo(restaurant_id, cur)
-                    if main:
-                        try:
-                            cur.execute(
-                                "INSERT INTO photo_likes (photo_id, user_id) VALUES (%s,%s)",
-                                (main["id"], user_id)
-                            )
-                        except Exception:
-                            pass
+                    cur.execute("INSERT INTO likes (restaurant_id, user_id) VALUES (%s,%s)",
+                                (restaurant_id, user_id))
                     conn.commit()
                     return "liked"
 
@@ -318,6 +346,45 @@ class CanteenDB:
                 )
                 return cur.fetchone() is not None
 
+    # ── 照片按讚 ──────────────────────────────────────────────────────────────
+    def toggle_photo_like(self, photo_id: int, user_id: str) -> str:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM photo_likes WHERE photo_id=%s AND user_id=%s",
+                    (photo_id, user_id)
+                )
+                if cur.fetchone():
+                    cur.execute("DELETE FROM photo_likes WHERE photo_id=%s AND user_id=%s",
+                                (photo_id, user_id))
+                    conn.commit()
+                    return "unliked"
+                else:
+                    cur.execute("INSERT INTO photo_likes (photo_id, user_id) VALUES (%s,%s)",
+                                (photo_id, user_id))
+                    conn.commit()
+                    return "liked"
+
+    def has_photo_liked(self, photo_id: int, user_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM photo_likes WHERE photo_id=%s AND user_id=%s",
+                    (photo_id, user_id)
+                )
+                return cur.fetchone() is not None
+
+    def get_photo_by_id(self, photo_id: int) -> Optional[dict]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM photos WHERE id=%s", (photo_id,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                r = dict(row)
+                r["like_count"] = self._photo_like_count(photo_id, cur)
+                return r
+
     # ── 評論 ──────────────────────────────────────────────────────────────────
     def add_comment(self, restaurant_id: int, user_id: str, content: str):
         with self._connect() as conn:
@@ -328,7 +395,7 @@ class CanteenDB:
                 )
             conn.commit()
 
-    def get_comments(self, restaurant_id: int, limit: int = 5) -> list[dict]:
+    def get_comments(self, restaurant_id: int, limit: int = 3) -> list[dict]:
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -341,7 +408,7 @@ class CanteenDB:
                         r["created_at"] = r["created_at"].strftime("%Y-%m-%d %H:%M:%S")
                 return rows
 
-    # ── 編輯（只保留名稱、評論、新增照片）──────────────────────────────────
+    # ── 編輯 ──────────────────────────────────────────────────────────────────
     def _update(self, field, rid, user_id, value):
         with self._connect() as conn:
             with conn.cursor() as cur:

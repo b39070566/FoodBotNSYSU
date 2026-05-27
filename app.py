@@ -19,7 +19,7 @@ from state_manager import StateManager, State
 from ai_analyzer import analyze_food_image
 from flex_messages import (
     restaurant_list_flex, restaurant_detail_flex,
-    share_success_flex, filter_menu_flex,
+    share_success_flex, filter_menu_flex, photos_carousel_flex,
 )
 
 app = Flask(__name__)
@@ -65,19 +65,31 @@ def reply(token, msg):
 
 
 def show_detail(reply_token, user_id, restaurant_id, id_list=None):
-    """顯示店家詳情，同時增加觀看數"""
+    """顯示詳情、記錄觀看、保留清單狀態"""
     r = db.get_by_id(restaurant_id)
     if not r:
         reply(reply_token, '找不到這筆資料')
         return
-    db.increment_views(restaurant_id)
+    db.log_view(restaurant_id, user_id)
     liked = db.has_liked(restaurant_id, user_id)
     comments = db.get_comments(restaurant_id, limit=3)
     states.set(user_id, State.WAIT_LIKE)
     states.set_data(user_id, 'view_id', restaurant_id)
-    if id_list:
+    if id_list is not None:
         states.set_data(user_id, 'list', id_list)
     reply(reply_token, restaurant_detail_flex(r, liked, comments))
+
+
+def refresh_detail(user_id, restaurant_id):
+    """按讚/評論/照片後 push 最新詳情"""
+    r = db.get_by_id(restaurant_id)
+    if not r:
+        return
+    liked = db.has_liked(restaurant_id, user_id)
+    comments = db.get_comments(restaurant_id, limit=3)
+    states.set(user_id, State.WAIT_LIKE)
+    states.set_data(user_id, 'view_id', restaurant_id)
+    line_bot_api.push_message(user_id, restaurant_detail_flex(r, liked, comments))
 
 
 @app.route('/callback', methods=['POST'])
@@ -116,7 +128,7 @@ def callback():
                     states.set_data(user_id, 'ai_category', ai['category'])
                     states.set_data(user_id, 'ai_price', ai['price_range'])
                     states.set(user_id, State.WAIT_AI_CONFIRM)
-                    confidence_note = {'high': '✅ 辨識很有把握', 'medium': '🔍 辨識有點把握', 'low': '⚠️ 建議手動修改'}.get(ai['confidence'], '')
+                    confidence_note = {'high': '✅ 很有把握', 'medium': '🔍 有點把握', 'low': '⚠️ 建議手動修改'}.get(ai['confidence'], '')
                     line_bot_api.push_message(user_id, TextSendMessage(
                         text=f"🤖 AI 辨識結果：\n🍽️ {ai['food_name']}\n🏷️ {ai['category']}\n💰 {ai['price_range']}\n{confidence_note}\n\n1. 確認使用\n2. 修改分類\n3. 修改價位\n4. 全部重選\n\n輸入 1~4"
                     ))
@@ -129,8 +141,8 @@ def callback():
                 try:
                     image_url = upload_image(image_bytes, event.message.id)
                     db.add_photo(rid, user_id, image_url)
-                    states.reset(user_id)
-                    reply(reply_token, '✅ 照片新增成功！按讚累積後會有機會成為主圖 📷')
+                    reply(reply_token, '✅ 照片新增成功！')
+                    refresh_detail(user_id, rid)
                 except Exception as e:
                     print(f'Error: {e}')
                     reply(reply_token, '❌ 照片上傳失敗，請再試一次')
@@ -144,7 +156,7 @@ def callback():
         msg = event.message.text.strip()
 
         # ══════════════════════════════════════════════════════════════════════
-        # 群組指令
+        # 群組
         # ══════════════════════════════════════════════════════════════════════
         if group:
             if msg == '近期推薦':
@@ -193,8 +205,8 @@ def callback():
                 rid = states.get_data(user_id).get('view_id')
                 result = db.toggle_like(rid, user_id)
                 r = db.get_by_id(rid)
-                states.reset(user_id)
                 reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else f"已收回「{r['name']}」的讚")
+                refresh_detail(user_id, rid)
                 continue
 
             if state == State.WAIT_LIKE and msg == '留評論':
@@ -207,11 +219,27 @@ def callback():
                 reply(reply_token, '請私訊 Bot 上傳照片 📷')
                 continue
 
+            if state == State.WAIT_LIKE and msg == '看所有照片':
+                rid = states.get_data(user_id).get('view_id')
+                r = db.get_by_id(rid)
+                if r and r.get('photos'):
+                    photo_ids = {p['id'] for p in r['photos'] if db.has_photo_liked(p['id'], user_id)}
+                    reply(reply_token, photos_carousel_flex(r['name'], r['photos'], user_id, photo_ids))
+                continue
+
+            if msg.startswith('照片讚 ') and msg.split()[-1].isdigit():
+                photo_id = int(msg.split()[-1])
+                result = db.toggle_photo_like(photo_id, user_id)
+                p = db.get_photo_by_id(photo_id)
+                if p:
+                    reply(reply_token, f"{'👍 已按讚！' if result == 'liked' else '已收回讚'} 這張照片現在有 {p['like_count']} 個讚")
+                continue
+
             if state == State.WAIT_COMMENT:
                 rid = states.get_data(user_id).get('view_id')
                 db.add_comment(rid, user_id, msg)
-                states.reset(user_id)
                 reply(reply_token, f'✅ 評論已新增：「{msg}」')
+                refresh_detail(user_id, rid)
                 continue
 
             if msg in ('我要分享', '管理我的分享'):
@@ -220,7 +248,7 @@ def callback():
             continue
 
         # ══════════════════════════════════════════════════════════════════════
-        # 私訊指令
+        # 私訊
         # ══════════════════════════════════════════════════════════════════════
         if msg == '取消':
             states.reset(user_id)
@@ -269,14 +297,13 @@ def callback():
                 states.set_data(user_id, 'dup_id', existing['id'])
                 states.set(user_id, State.WAIT_DUP_CONFIRM)
                 reply(reply_token,
-                      f"⚠️ 「{msg}」已經有人分享過了！\n\n"
+                      f"⚠️ 「{msg}」已有人分享過！\n\n"
                       f"🏷️ {existing.get('category','')}\n"
                       f"💬 「{existing['review']}」\n\n"
                       f"1. 幫這家店按讚 👍\n"
-                      f"2. 新增這家店的照片 📷\n"
-                      f"3. 留下評論 ✏️\n"
-                      f"4. 還是要另外新增\n\n"
-                      f"輸入 1~4")
+                      f"2. 新增照片 📷\n"
+                      f"3. 留評論 ✏️\n"
+                      f"4. 另外新增\n\n輸入 1~4")
             else:
                 states.set_data(user_id, 'name', msg)
                 states.set(user_id, State.WAIT_IMAGE)
@@ -290,7 +317,7 @@ def callback():
                 result = db.toggle_like(rid, user_id)
                 r = db.get_by_id(rid)
                 states.reset(user_id)
-                reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else f"已收回讚")
+                reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else "已收回讚")
             elif choice == 2:
                 states.set_data(user_id, 'view_id', rid)
                 states.set(user_id, State.ADD_PHOTO)
@@ -345,21 +372,11 @@ def callback():
         if state == State.WAIT_COMMENT:
             rid = states.get_data(user_id).get('view_id')
             db.add_comment(rid, user_id, msg)
-            states.reset(user_id)
             reply(reply_token, f'✅ 評論已新增：「{msg}」')
+            refresh_detail(user_id, rid)
             continue
 
-        # ── 新增照片 ──────────────────────────────────────────────────────────
-        if msg == '新增照片':
-            rid = states.get_data(user_id).get('view_id')
-            if rid:
-                states.set(user_id, State.ADD_PHOTO)
-                reply(reply_token, '請上傳新的食物照片 📷')
-            else:
-                reply(reply_token, '請先查看一家店再新增照片')
-            continue
-
-        # ── 近期推薦（私訊）──────────────────────────────────────────────────
+        # ── 近期推薦 ──────────────────────────────────────────────────────────
         if msg == '近期推薦':
             restaurants = db.get_recent(limit=30)
             if not restaurants:
@@ -404,12 +421,31 @@ def callback():
                 show_detail(reply_token, user_id, id_list[idx], id_list)
             continue
 
+        # ── 看所有照片 ────────────────────────────────────────────────────────
+        if state == State.WAIT_LIKE and msg == '看所有照片':
+            rid = states.get_data(user_id).get('view_id')
+            r = db.get_by_id(rid)
+            if r and r.get('photos'):
+                photo_ids = {p['id'] for p in r['photos'] if db.has_photo_liked(p['id'], user_id)}
+                reply(reply_token, photos_carousel_flex(r['name'], r['photos'], user_id, photo_ids))
+            continue
+
+        # ── 照片按讚 ──────────────────────────────────────────────────────────
+        if msg.startswith('照片讚 ') and msg.split()[-1].isdigit():
+            photo_id = int(msg.split()[-1])
+            result = db.toggle_photo_like(photo_id, user_id)
+            p = db.get_photo_by_id(photo_id)
+            if p:
+                reply(reply_token, f"{'👍 按讚成功！' if result == 'liked' else '已收回讚'} 這張照片現在有 {p['like_count']} 個讚")
+            continue
+
+        # ── 店家按讚 ──────────────────────────────────────────────────────────
         if state == State.WAIT_LIKE and msg == '讚':
             rid = states.get_data(user_id).get('view_id')
             result = db.toggle_like(rid, user_id)
             r = db.get_by_id(rid)
-            states.reset(user_id)
             reply(reply_token, f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else f"已收回「{r['name']}」的讚")
+            refresh_detail(user_id, rid)
             continue
 
         if state == State.WAIT_LIKE and msg == '留評論':
@@ -449,11 +485,7 @@ def callback():
                     reply(reply_token,
                           f"📍 {r['name']}\n"
                           f"🏷️ {r.get('category','')}　{r.get('price_range','')}\n\n"
-                          f"1. 修改店家名稱\n"
-                          f"2. 修改分類\n"
-                          f"3. 修改價位\n"
-                          f"4. 新增照片\n\n"
-                          f"輸入 1~4")
+                          f"1. 修改店家名稱\n2. 修改分類\n3. 修改價位\n4. 新增照片\n\n輸入 1~4")
                     continue
             reply(reply_token, '請輸入有效的編號')
             continue
@@ -519,8 +551,8 @@ def introduction() -> str:
         '📤 我要分享（私訊）\n'
         '   → 名稱→照片（AI辨識）→評論\n\n'
         '📋 近期推薦（私訊或群組）\n'
-        '   → Flex 卡片，點「查看詳情」\n'
-        '   → 可按讚、留評論、新增照片\n\n'
+        '   → 卡片點「查看詳情」\n'
+        '   → 按讚 / 留評論 / 新增照片 / 看所有照片\n\n'
         '🔍 篩選分類（私訊或群組）\n\n'
         '✏️ 管理我的分享（私訊）\n\n'
         '❌ 取消　　📖 說明'
