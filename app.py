@@ -15,6 +15,7 @@ import cloudinary
 import cloudinary.uploader
 
 from canteen_db import CanteenDB, CATEGORIES, PRICE_RANGES
+from admin import admin_bp
 from state_manager import StateManager, State
 from ai_analyzer import analyze_food_image
 from flex_messages import (
@@ -23,6 +24,8 @@ from flex_messages import (
 )
 
 app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'nsysu-food-bot-secret-2024')
+app.register_blueprint(admin_bp)
 
 channel_secret = os.getenv('LINE_CHANNEL_SECRET')
 channel_access_token = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
@@ -318,12 +321,35 @@ def callback():
                 reply(reply_token, f'✅ 評論 {arg} 已刪除' if db.admin_delete_comment(arg) else '找不到這則評論')
                 continue
 
+            if msg in ('店家列表', '所有店家'):
+                restaurants = db.admin_get_all_restaurants()
+                if not restaurants:
+                    reply(reply_token, '目前沒有任何店家')
+                else:
+                    lines = [f'🏪 全部店家（共{len(restaurants)}家）\n']
+                    status_map = {'active': '✅', 'pending_review': '⚠️', 'hidden': '🚫'}
+                    for r in restaurants:
+                        st = status_map.get(r['status'], '?')
+                        lines.append(f"{st} ID:{r['id']} {r['name']}　{r.get('category','')}")
+                    lines.append('\n查店家 ID 看詳情')
+                    reply(reply_token, '\n'.join(lines))
+                continue
+
+            if msg == '正常店家':
+                restaurants = db.admin_get_all_restaurants(status='active')
+                lines = [f'✅ 正常店家（共{len(restaurants)}家）\n']
+                for r in restaurants:
+                    lines.append(f"ID:{r['id']} {r['name']}　{r.get('category','')}")
+                reply(reply_token, '\n'.join(lines) if len(lines) > 1 else '目前沒有正常店家')
+                continue
+
             if msg == '管理說明':
                 admin_help = (
                     '🔧 管理員指令\n'
                     '━━━━━━━━━━━━━━━━━━\n'
                     '📋 查詢\n'
                     '  待審核\n'
+                    '  店家列表 / 正常店家\n'
                     '  查店家 ID\n'
                     '  查照片 ID\n'
                     '  查評論 ID（店家ID）\n\n'
