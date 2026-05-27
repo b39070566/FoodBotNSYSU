@@ -166,6 +166,7 @@ def callback():
 
         user_id = event.source.user_id
         reply_token = event.reply_token
+        print(f'[DEBUG] user_id={user_id} group={is_group(event)}')
         state = states.get(user_id)
         group = is_group(event)
 
