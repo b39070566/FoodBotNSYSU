@@ -224,4 +224,399 @@ def callback():
             if msg == '近期推薦':
                 restaurants = db.get_recent(limit=30)
                 if not restaurants:
-                    reply(reply_token, '目前還沒有
+                    reply(reply_token, '目前還沒有任何分享，私訊 Bot 輸入「我要分享」來新增！')
+                    continue
+                states.reset(user_id)
+                states.set(user_id, State.WAIT_PICK)
+                states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+                reply(reply_token, restaurant_list_flex(restaurants))
+                continue
+            if msg == '篩選分類':
+                states.reset(user_id)
+                states.set(user_id, State.FILTER_PICK)
+                reply(reply_token, filter_menu_flex())
+                continue
+            if msg.startswith('分類選擇 ') and msg.split()[-1].isdigit():
+                idx = int(msg.split()[-1]) - 1
+                if idx == 7:
+                    restaurants = db.get_recent(limit=30)
+                    label = '全部推薦'
+                elif 0 <= idx < len(CATEGORIES):
+                    restaurants = db.get_recent(limit=30, category=CATEGORIES[idx])
+                    label = CATEGORIES[idx]
+                else:
+                    continue
+                if not restaurants:
+                    reply(reply_token, f'目前沒有「{label}」的分享')
+                    continue
+                states.set(user_id, State.WAIT_PICK)
+                states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+                reply(reply_token, restaurant_list_flex(restaurants))
+                continue
+            if msg.startswith('詳情 ') and msg.split()[-1].isdigit():
+                idx = int(msg.split()[-1]) - 1
+                id_list = states.get_data(user_id).get('list', [])
+                if 0 <= idx < len(id_list):
+                    show_detail(reply_token, user_id, id_list[idx], id_list)
+                continue
+            if state == State.WAIT_LIKE and msg == '讚':
+                rid = states.get_data(user_id).get('view_id')
+                result = db.toggle_like(rid, user_id)
+                r = db.get_by_id(rid)
+                reply(reply_token,
+                      f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else f"已收回「{r['name']}」的讚")
+                refresh_detail(user_id, rid)
+                continue
+            if state == State.WAIT_LIKE and msg == '留評論':
+                states.set(user_id, State.WAIT_COMMENT)
+                reply(reply_token, '請輸入你的評論：')
+                continue
+            if state == State.WAIT_LIKE and msg == '新增照片':
+                states.set(user_id, State.ADD_PHOTO)
+                reply(reply_token, '請私訊 Bot 上傳照片 📷')
+                continue
+            if state == State.WAIT_LIKE and msg == '看所有照片':
+                rid = states.get_data(user_id).get('view_id')
+                handle_photos_view(reply_token, user_id, rid)
+                continue
+            if msg.startswith('照片讚 ') and msg.split()[-1].isdigit():
+                photo_id = int(msg.split()[-1])
+                result = db.toggle_photo_like(photo_id, user_id)
+                p = db.get_photo_by_id(photo_id)
+                if p:
+                    reply(reply_token,
+                          f"{'👍 按讚成功！' if result == 'liked' else '已收回讚'} 這張照片有 {p['like_count']} 個讚")
+                continue
+            if msg.startswith('檢舉照片 ') and msg.split()[-1].isdigit():
+                photo_id = int(msg.split()[-1])
+                p = db.get_photo_by_id(photo_id)
+                if not p:
+                    reply(reply_token, '找不到這張照片')
+                    continue
+                result = db.report_photo(photo_id, user_id)
+                if result == 'already_reported':
+                    reply(reply_token, '你已經檢舉過這張照片了')
+                elif result == 'hidden':
+                    reply(reply_token, '🚫 此照片已達檢舉上限，暫時下架等待管理員審核')
+                    r = db.get_by_id(p['restaurant_id'])
+                    notify_admin(photo_id, r['name'] if r else '未知', result)
+                elif result == 'pending_review':
+                    reply(reply_token, '⚠️ 檢舉已送出，此照片將等待管理員審核')
+                    r = db.get_by_id(p['restaurant_id'])
+                    notify_admin(photo_id, r['name'] if r else '未知', result)
+                else:
+                    reply(reply_token, '✅ 檢舉已送出，謝謝你的回報')
+                continue
+            if state == State.WAIT_COMMENT:
+                rid = states.get_data(user_id).get('view_id')
+                db.add_comment(rid, user_id, msg)
+                reply(reply_token, f'✅ 評論已新增：「{msg}」')
+                refresh_detail(user_id, rid)
+                continue
+            if msg in ('我要分享', '管理我的分享'):
+                reply(reply_token, '請私訊 Bot 來進行這個操作 😊')
+                continue
+            continue
+
+        # ── 私訊 ──────────────────────────────────────────────────────────
+        if msg == '取消':
+            states.reset(user_id)
+            reply(reply_token, '已取消，輸入「說明」查看功能')
+            continue
+        if msg in ('說明', 'help'):
+            reply(reply_token, introduction())
+            states.reset(user_id)
+            continue
+        if state == State.WAIT_AI_CONFIRM and msg.isdigit():
+            choice = int(msg)
+            data = states.get_data(user_id)
+            if choice == 1:
+                states.set_data(user_id, 'category', data['ai_category'])
+                states.set_data(user_id, 'price_range', data['ai_price'])
+                states.set(user_id, State.WAIT_REVIEW)
+                reply(reply_token, '✅ 好！請輸入一句【評論】')
+            elif choice == 2:
+                states.set(user_id, State.WAIT_CATEGORY)
+                reply(reply_token, CATEGORY_MENU)
+            elif choice == 3:
+                states.set_data(user_id, 'category', data['ai_category'])
+                states.set(user_id, State.WAIT_PRICE)
+                reply(reply_token, PRICE_MENU)
+            elif choice == 4:
+                states.set(user_id, State.WAIT_CATEGORY)
+                reply(reply_token, CATEGORY_MENU)
+            else:
+                reply(reply_token, '請輸入 1~4')
+            continue
+        if msg == '我要分享':
+            states.reset(user_id)
+            states.set(user_id, State.WAIT_NAME)
+            reply(reply_token, '🍱 好！請先輸入【店家名稱】\n\n（輸入「取消」可隨時離開）')
+            continue
+        if state == State.WAIT_NAME:
+            existing = db.find_by_name(msg)
+            if existing:
+                states.set_data(user_id, 'name', msg)
+                states.set_data(user_id, 'dup_id', existing['id'])
+                states.set(user_id, State.WAIT_DUP_CONFIRM)
+                reply(reply_token,
+                      f"⚠️ 「{msg}」已有人分享過！\n\n"
+                      f"🏷️ {existing.get('category', '')}\n"
+                      f"💬 「{existing['review']}」\n\n"
+                      f"1. 幫這家店按讚 👍\n"
+                      f"2. 新增照片 📷\n"
+                      f"3. 留評論 ✏️\n"
+                      f"4. 另外新增\n\n輸入 1~4")
+            else:
+                states.set_data(user_id, 'name', msg)
+                states.set(user_id, State.WAIT_IMAGE)
+                reply(reply_token, f'✅ 店家名稱：{msg}\n\n請上傳一張【食物照片】📷\n（AI 會自動辨識分類和價位）')
+            continue
+        if state == State.WAIT_DUP_CONFIRM and msg.isdigit():
+            choice = int(msg)
+            rid = states.get_data(user_id).get('dup_id')
+            if choice == 1:
+                result = db.toggle_like(rid, user_id)
+                r = db.get_by_id(rid)
+                states.reset(user_id)
+                reply(reply_token,
+                      f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else "已收回讚")
+            elif choice == 2:
+                states.set_data(user_id, 'view_id', rid)
+                states.set(user_id, State.ADD_PHOTO)
+                reply(reply_token, '請上傳新照片 📷')
+            elif choice == 3:
+                states.set_data(user_id, 'view_id', rid)
+                states.set(user_id, State.WAIT_COMMENT)
+                reply(reply_token, '請輸入你的評論：')
+            elif choice == 4:
+                states.set(user_id, State.WAIT_IMAGE)
+                reply(reply_token, '請上傳一張【食物照片】📷')
+            else:
+                reply(reply_token, '請輸入 1~4')
+            continue
+        if state == State.WAIT_CATEGORY and msg.isdigit():
+            idx = int(msg) - 1
+            if 0 <= idx < len(CATEGORIES):
+                states.set_data(user_id, 'category', CATEGORIES[idx])
+                data = states.get_data(user_id)
+                if data.get('price_range'):
+                    states.set(user_id, State.WAIT_REVIEW)
+                    reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n請輸入一句【評論】')
+                else:
+                    states.set(user_id, State.WAIT_PRICE)
+                    reply(reply_token, f'✅ 分類：{CATEGORIES[idx]}\n\n' + PRICE_MENU)
+            else:
+                reply(reply_token, CATEGORY_MENU)
+            continue
+        if state == State.WAIT_PRICE and msg.isdigit():
+            idx = int(msg) - 1
+            if 0 <= idx < len(PRICE_RANGES):
+                states.set_data(user_id, 'price_range', PRICE_RANGES[idx])
+                states.set(user_id, State.WAIT_REVIEW)
+                reply(reply_token, f'✅ 價位：{PRICE_RANGES[idx]}\n\n請輸入一句【評論】')
+            else:
+                reply(reply_token, PRICE_MENU)
+            continue
+        if state == State.WAIT_REVIEW:
+            data = states.get_data(user_id)
+            db.add_restaurant(
+                user_id=user_id, name=data['name'], category=data['category'],
+                price_range=data['price_range'], image_url=data['image_url'], review=msg,
+            )
+            states.reset(user_id)
+            reply(reply_token, share_success_flex(data['name'], data['category'], data['price_range'], msg))
+            continue
+        if state == State.WAIT_COMMENT:
+            rid = states.get_data(user_id).get('view_id')
+            db.add_comment(rid, user_id, msg)
+            reply(reply_token, f'✅ 評論已新增：「{msg}」')
+            refresh_detail(user_id, rid)
+            continue
+        if msg == '近期推薦':
+            restaurants = db.get_recent(limit=30)
+            if not restaurants:
+                reply(reply_token, '目前還沒有任何分享，輸入「我要分享」來成為第一個！')
+                continue
+            states.reset(user_id)
+            states.set(user_id, State.WAIT_PICK)
+            states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+            reply(reply_token, restaurant_list_flex(restaurants))
+            continue
+        if msg == '篩選分類':
+            states.reset(user_id)
+            states.set(user_id, State.FILTER_PICK)
+            reply(reply_token, filter_menu_flex())
+            continue
+        if msg.startswith('分類選擇 ') and msg.split()[-1].isdigit():
+            idx = int(msg.split()[-1]) - 1
+            if idx == 7:
+                restaurants = db.get_recent(limit=30)
+                label = '全部推薦'
+            elif 0 <= idx < len(CATEGORIES):
+                restaurants = db.get_recent(limit=30, category=CATEGORIES[idx])
+                label = CATEGORIES[idx]
+            else:
+                reply(reply_token, '請重新選擇')
+                continue
+            if not restaurants:
+                states.reset(user_id)
+                reply(reply_token, f'目前沒有「{label}」的分享')
+                continue
+            states.set(user_id, State.WAIT_PICK)
+            states.set_data(user_id, 'list', [r['id'] for r in restaurants])
+            reply(reply_token, restaurant_list_flex(restaurants))
+            continue
+        if msg.startswith('詳情 ') and msg.split()[-1].isdigit():
+            idx = int(msg.split()[-1]) - 1
+            id_list = states.get_data(user_id).get('list', [])
+            if 0 <= idx < len(id_list):
+                show_detail(reply_token, user_id, id_list[idx], id_list)
+            continue
+        if state == State.WAIT_LIKE and msg == '看所有照片':
+            rid = states.get_data(user_id).get('view_id')
+            handle_photos_view(reply_token, user_id, rid)
+            continue
+        if msg.startswith('照片讚 ') and msg.split()[-1].isdigit():
+            photo_id = int(msg.split()[-1])
+            result = db.toggle_photo_like(photo_id, user_id)
+            p = db.get_photo_by_id(photo_id)
+            if p:
+                reply(reply_token,
+                      f"{'👍 按讚成功！' if result == 'liked' else '已收回讚'} 這張照片有 {p['like_count']} 個讚")
+            continue
+        if msg.startswith('檢舉照片 ') and msg.split()[-1].isdigit():
+            photo_id = int(msg.split()[-1])
+            p = db.get_photo_by_id(photo_id)
+            if not p:
+                reply(reply_token, '找不到這張照片')
+                continue
+            result = db.report_photo(photo_id, user_id)
+            if result == 'already_reported':
+                reply(reply_token, '你已經檢舉過這張照片了')
+            elif result == 'hidden':
+                reply(reply_token, '🚫 此照片已達檢舉上限，暫時下架等待管理員審核')
+                r = db.get_by_id(p['restaurant_id'])
+                notify_admin(photo_id, r['name'] if r else '未知', result)
+            elif result == 'pending_review':
+                reply(reply_token, '⚠️ 檢舉已送出，此照片將等待管理員審核')
+                r = db.get_by_id(p['restaurant_id'])
+                notify_admin(photo_id, r['name'] if r else '未知', result)
+            else:
+                reply(reply_token, '✅ 檢舉已送出，謝謝你的回報')
+            continue
+        if state == State.WAIT_LIKE and msg == '讚':
+            rid = states.get_data(user_id).get('view_id')
+            result = db.toggle_like(rid, user_id)
+            r = db.get_by_id(rid)
+            reply(reply_token,
+                  f"👍 已幫「{r['name']}」按讚！現在共 {r['like_count']} 個讚" if result == 'liked' else f"已收回「{r['name']}」的讚")
+            refresh_detail(user_id, rid)
+            continue
+        if state == State.WAIT_LIKE and msg == '留評論':
+            states.set(user_id, State.WAIT_COMMENT)
+            reply(reply_token, '請輸入你的評論：')
+            continue
+        if state == State.WAIT_LIKE and msg == '新增照片':
+            states.set(user_id, State.ADD_PHOTO)
+            reply(reply_token, '請上傳新的食物照片 📷')
+            continue
+        if msg == '管理我的分享':
+            my_list = db.get_by_user(user_id)
+            if not my_list:
+                reply(reply_token, '你還沒有任何分享，輸入「我要分享」新增！')
+                continue
+            states.reset(user_id)
+            states.set(user_id, State.MANAGE_PICK)
+            states.set_data(user_id, 'my_list', [r['id'] for r in my_list])
+            lines = ['📋 我的分享（輸入編號選擇）\n']
+            for i, r in enumerate(my_list, 1):
+                lines.append(f"{i}. {r['name']}　{r.get('category', '')}")
+            reply(reply_token, '\n'.join(lines))
+            continue
+        if state == State.MANAGE_PICK and msg.isdigit():
+            idx = int(msg) - 1
+            my_list = states.get_data(user_id).get('my_list', [])
+            if 0 <= idx < len(my_list):
+                rid = my_list[idx]
+                r = db.get_by_id(rid)
+                if r:
+                    states.set(user_id, State.MANAGE_ACTION)
+                    states.set_data(user_id, 'edit_id', rid)
+                    reply(reply_token,
+                          f"📍 {r['name']}\n"
+                          f"🏷️ {r.get('category', '')}　{r.get('price_range', '')}\n\n"
+                          f"1. 修改店家名稱\n2. 修改分類\n3. 修改價位\n4. 新增照片\n\n輸入 1~4")
+                    continue
+            reply(reply_token, '請輸入有效的編號')
+            continue
+        if state == State.MANAGE_ACTION and msg.isdigit():
+            action = int(msg)
+            rid = states.get_data(user_id).get('edit_id')
+            if action == 1:
+                states.set(user_id, State.EDIT_NAME)
+                reply(reply_token, '請輸入新的【店家名稱】')
+            elif action == 2:
+                states.set(user_id, State.EDIT_CATEGORY)
+                reply(reply_token, CATEGORY_MENU)
+            elif action == 3:
+                states.set(user_id, State.EDIT_PRICE)
+                reply(reply_token, PRICE_MENU)
+            elif action == 4:
+                states.set_data(user_id, 'view_id', rid)
+                states.set(user_id, State.ADD_PHOTO)
+                reply(reply_token, '請上傳新的食物照片 📷')
+            else:
+                reply(reply_token, '請輸入 1~4')
+            continue
+        if state == State.EDIT_NAME:
+            rid = states.get_data(user_id).get('edit_id')
+            db.update_name(rid, user_id, msg)
+            states.reset(user_id)
+            reply(reply_token, f'✅ 店家名稱已更新為：{msg}')
+            continue
+        if state == State.EDIT_CATEGORY and msg.isdigit():
+            idx = int(msg) - 1
+            if 0 <= idx < len(CATEGORIES):
+                rid = states.get_data(user_id).get('edit_id')
+                db.update_category(rid, user_id, CATEGORIES[idx])
+                states.reset(user_id)
+                reply(reply_token, f'✅ 分類已更新為：{CATEGORIES[idx]}')
+            else:
+                reply(reply_token, CATEGORY_MENU)
+            continue
+        if state == State.EDIT_PRICE and msg.isdigit():
+            idx = int(msg) - 1
+            if 0 <= idx < len(PRICE_RANGES):
+                rid = states.get_data(user_id).get('edit_id')
+                db.update_price_range(rid, user_id, PRICE_RANGES[idx])
+                states.reset(user_id)
+                reply(reply_token, f'✅ 價位已更新為：{PRICE_RANGES[idx]}')
+            else:
+                reply(reply_token, PRICE_MENU)
+            continue
+        reply(reply_token, '輸入「說明」查看所有功能 😊')
+    return 'OK'
+
+
+def introduction() -> str:
+    return (
+        '📋 學生餐廳分享系統 使用說明\n'
+        '━━━━━━━━━━━━━━━━━━\n'
+        '📤 我要分享（私訊）\n'
+        '   → 名稱→照片（AI辨識）→評論\n\n'
+        '📋 近期推薦（私訊或群組）\n'
+        '   → 卡片點「查看詳情」\n'
+        '   → 按讚 / 留評論 / 新增照片 / 看所有照片\n\n'
+        '🔍 篩選分類（私訊或群組）\n\n'
+        '✏️ 管理我的分享（私訊）\n\n'
+        '❌ 取消　　📖 說明'
+    )
+
+
+if __name__ == '__main__':
+    arg_parser = ArgumentParser()
+    arg_parser.add_argument('-p', '--port', type=int, default=8000)
+    arg_parser.add_argument('-d', '--debug', default=False)
+    options = arg_parser.parse_args()
+    app.run(debug=options.debug, port=options.port)
